@@ -1,0 +1,10 @@
+# dsh-code-review bundle patch: inserts one Host plugin row.
+#
+# The row id is how a higher-priority layer (the profile's own cordis.patch.yml)
+# would override this plugin's configuration. The plugin declares no Config
+# schema: its settings live in DSH_HOME/code-review/config.json and are re-read
+# on every `/review`, so tuning needs no restart.
+
+- insert:
+    - id: code-review
+      name: '@local/dsh-code-review'
