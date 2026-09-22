@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-code-review",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "On-demand code review for DeepSeek Harness: audits the uncommitted changes in a workspace with a code-review specialist model and renders the report as a card in the conversation, for the human who asked for it.",

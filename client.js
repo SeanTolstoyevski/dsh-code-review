@@ -29,6 +29,7 @@ window.__ModuleLoader__.load({
       'state.error': 'The review did not complete',
       'label.findings': 'Findings',
       'label.skipped': 'Left out of the review',
+      'label.ignored': 'Excluded by the ignore rules',
       'label.fix': 'Fix',
       'label.impact': 'Impact',
       'label.trigger': 'How it is reached',
@@ -40,6 +41,7 @@ window.__ModuleLoader__.load({
       'stat.lines': 'lines',
       'stat.reviewed': 'reviewed',
       'stat.skipped': 'left out',
+      'stat.ignored': 'ignored',
       'stat.findings': 'findings',
       'stat.withheld': 'withheld',
       'stat.reads': 'context reads',
@@ -63,6 +65,7 @@ window.__ModuleLoader__.load({
       'state.error': '审核未能完成',
       'label.findings': '问题清单',
       'label.skipped': '未纳入审核',
+      'label.ignored': '被忽略规则排除',
       'label.fix': '修改建议',
       'label.impact': '会造成什么',
       'label.trigger': '如何被触发',
@@ -74,6 +77,7 @@ window.__ModuleLoader__.load({
       'stat.lines': '行',
       'stat.reviewed': '已审核',
       'stat.skipped': '未纳入',
+      'stat.ignored': '条被忽略',
       'stat.findings': '个问题',
       'stat.withheld': '条被扣留',
       'stat.reads': '次上下文读取',
@@ -259,6 +263,8 @@ window.__ModuleLoader__.load({
       ]
       const skipped = Array.isArray(stats.skipped) ? stats.skipped.length : 0
       if (skipped > 0) parts.push(`${skipped} ${t('stat.skipped')}`)
+      const ignored = stats.ignore?.count ?? 0
+      if (ignored > 0) parts.push(`${ignored} ${t('stat.ignored')}`)
       const findings = Array.isArray(payload.findings) ? payload.findings : []
       const bySeverity = SEVERITIES
         .map(severity => [severity, findings.filter(finding => finding.severity === severity).length])
@@ -354,6 +360,24 @@ window.__ModuleLoader__.load({
       ])
     }
 
+    /**
+     * What the ignore rules took out of the change set, with the rule that took
+     * it. The count is the truth and the list is a sample, so a report never
+     * grows a dependency tree it was asked to leave out.
+     */
+    function ignoredList(ignore, t) {
+      const sample = Array.isArray(ignore?.sample) ? ignore.sample : []
+      if (sample.length === 0) return null
+      return h('div', { className: 'dcr-section' }, [
+        h('div', { className: 'dcr-section-label', key: 'label' }, `${t('label.ignored')} (${ignore.count ?? sample.length})`),
+        h('ul', { className: 'dcr-list', key: 'list' }, sample.map((item, index) => h(
+          'li',
+          { key: `${item?.file ?? index}` },
+          `${item?.file ?? '?'} — ${item?.rule ?? '?'}`,
+        ))),
+      ])
+    }
+
     function withheldList(withheld, t) {
       if (!Array.isArray(withheld) || withheld.length === 0) return null
       return h('div', { className: 'dcr-section' }, [
@@ -433,6 +457,7 @@ window.__ModuleLoader__.load({
               : h('div', { key: 'list' }, findings.map((finding, index) => findingRow(finding, index, t))),
           ]),
           skippedList(payload.stats?.skipped, t),
+          ignoredList(payload.stats?.ignore, t),
           withheldList(payload.withheld, t),
         ]) : null,
       ])

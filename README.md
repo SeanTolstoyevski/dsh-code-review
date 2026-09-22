@@ -32,17 +32,65 @@ installed with it: the package is plain JavaScript with no dependencies.
 ## Use
 
 ```
-/review [full|session] [provider=<id>] [model=<id>] [language=<code>] [gitRev=<rev>] [source=auto|git|session] [focus message]
+/review [full|session] [provider=<id>] [model=<id>] [language=<code>] [gitRev=<rev>] [source=auto|git|session] [ignored=<pattern,…>] [focus message]
 ```
 
 - `/review` or `/review full` — every uncommitted change in the **repository**
   against `gitRev` (default `HEAD`), untracked files included. Files this session
   wrote or edited are marked *primary*, the rest as *not by this session*;
 - `/review session` — only the files this session wrote or edited;
+- `ignored=<pattern>[,…]` — ignore patterns for this run, on top of the built-in
+  list and the config file; repeat the key to add more, and prefix a pattern with
+  `!` to put a path back (`/review ignored=fixtures/,!dist/`);
+- `ignoreDefaults=false` / `respectGitIgnore=false` — drop the built-in list for
+  this run, or stop honoring the repository's own ignore rules;
 - everything after the arguments is a **focus message**: the only text of yours
   the reviewer ever sees (`/review session board.go satır 13`).
 
 The reviewer never reads the conversation. Your chat messages do not reach it.
+
+### Ignored paths
+
+A review is about the code someone wrote, so the paths nobody wants reviewed are
+kept out of it — before a diff is built, before a file is read, and before the
+`maxFiles` budget is spent on them.
+
+- **The built-in standard list.** Dependency trees (`node_modules/`, `vendor/`,
+  `bower_components/`, `Pods/`), build output (`dist/`, `build/`, `target/`,
+  `out/`, `.next/`, `_build/`), caches and coverage (`.cache/`, `__pycache__/`,
+  `coverage/`, `.pytest_cache/`, `.terraform/`), generated bundles (`*.min.js`,
+  `*.js.map`, `*.tsbuildinfo`), editor and OS noise (`.idea/`, `.vscode/`,
+  `.DS_Store`, `Thumbs.db`), logs and local state (`*.log`, `*.tmp`, `*.sqlite`,
+  `*.db`) and the environment files nobody commits (`.env`, `.env.*` — with
+  `.env.example` and friends put back). The list is `DEFAULT_IGNORE` in
+  `index.js`, and `ignoreDefaults: false` turns it off;
+- **`ignored` in `config.json` and `ignored=` on the command line**, adding
+  patterns in gitignore syntax: `*` and `?` stop at a `/`, `**` crosses
+  directories, a leading or middle `/` anchors the pattern at the root of the
+  change set, a trailing `/` names a directory, `#` is a comment;
+- **the repository's own ignore rules**, tracked files included: a
+  `node_modules` that was committed once is still `node_modules`. Untracked
+  ignored files never reach the plugin at all, because `git status` omits them.
+  `respectGitIgnore: false` turns this layer off.
+
+The last matching pattern wins, so a `!pattern` — in the config or typed after
+`/review` — puts back anything an earlier rule took out:
+
+```
+/review ignored=!dist/             review dist/ after all
+/review ignored=fixtures/,!dist/   keep fixtures/ out, review dist/
+/review ignored=!*                 ignore nothing, review everything
+/review ignoredDefaults=false      no built-in list for this run
+```
+
+Nothing is dropped in silence: the report says how many changed files the rules
+excluded and names up to five of them with the rule behind each, the reviewer is
+told the same, and a change set that is *entirely* ignored is reported as such
+rather than as a clean tree. `session` scope counts only the session's own files —
+when the rules removed one of them, the run says which file and which rule
+excluded it instead of reporting that the session changed nothing. The reviewer's
+read-only tools answer under the same rules, so an ignored file cannot be
+searched, read back, quoted as evidence or named in a finding.
 
 ### On the card
 
@@ -57,7 +105,9 @@ instruction that follows from it — is yours to give.
 
 ## How it works
 
-1. changes are collected — git first, otherwise the session's own recorded changes;
+1. changes are collected — git first, otherwise the session's own recorded
+   changes — and everything the ignore rules cover is dropped before a diff is
+   built;
 2. unified diffs are built, within `maxFiles` and `maxDiffChars`;
 3. the reviewer may read the workspace with read-only tools when the diff alone
    cannot settle a question;
@@ -79,14 +129,19 @@ from the findings that survive.
 **Reader tools.** `read_file`, `list_dir` and `search`, implemented inside this
 plugin. No command, no shell, no write, no network. Paths are resolved to their
 real target and must stay inside the workspace, so a symlink cannot be used to
-read outside it. Reading is bounded by `maxToolCalls`, `maxReadBytes`,
-`maxSearchResults` and `toolDeadlineRatio`; when a bound is reached the reviewer is
-told and must answer. Set `projectAccess: false` for a diff-only review.
+read outside it, and the ignore rules of the run apply to them as well. Reading is
+bounded by `maxToolCalls`, `maxReadBytes`, `maxSearchResults` and
+`toolDeadlineRatio`; when a bound is reached the reviewer is told and must answer.
+Set `projectAccess: false` for a diff-only review.
 
 ## Configuration
 
-`DSH_HOME/code-review/config.json`. Every key is optional and the file is re-read
-on every run — tuning needs neither a restart nor a reload.
+`DSH_HOME/code-review/config.json` — the harness home, which is `$DSH_HOME` when
+that variable is set and not blank, and `~/.dsh` otherwise. It is never the
+current working directory: `dsh web` is started from wherever you happen to be,
+and a config read from there would quietly be no config at all. Every key is
+optional and the file is re-read on every run — tuning needs neither a restart
+nor a reload, and each run logs the file it read and the values in force.
 
 ```json
 {
@@ -106,7 +161,10 @@ on every run — tuning needs neither a restart nor a reload.
   "maxHintChars": 600,
   "maxTokens": 50000,
   "temperature": 0.1,
-  "timeoutMs": 600000
+  "timeoutMs": 600000,
+  "ignored": [],
+  "ignoreDefaults": true,
+  "respectGitIgnore": true
 }
 ```
 
@@ -120,6 +178,9 @@ on every run — tuning needs neither a restart nor a reload.
 | `maxToolCalls`, `maxReadBytes`, `maxSearchResults`, `toolDeadlineRatio` | Reader budgets. |
 | `maxFiles`, `maxDiffChars` | Reviewed files and total diff size; the rest are listed as left out. |
 | `maxHintChars` | Cap on the focus message you type. |
+| `ignored` | Extra ignore patterns (an array, or one string with commas or newlines between them), on top of the built-in standard list. Prefix a pattern with `!` to put a path back. |
+| `ignoreDefaults` | `true` (default): the built-in standard list applies. `false` reviews dependency trees and build output like anything else. |
+| `respectGitIgnore` | `true` (default): the repository's own ignore rules are honored too, tracked files included. `false` reviews them. |
 | `maxTokens`, `temperature`, `timeoutMs` | Output cap, sampling and the budget for the whole run. A first call that fails is retried once without project access and with the output cap lowered to 8192 or to the configured value when that is smaller; the report says the run was degraded. |
 
 ## Findings
@@ -129,9 +190,10 @@ Categories: `correctness`, `concurrency`, `error-handling`, `security`,
 `major`, `minor`, `nit`. The verdict is `fail` when a blocker or major survives the
 evidence gate, `warn` for minor or nit only, otherwise `pass`.
 
-A file that is binary, oversized or over a budget is reported as **left out**,
-never silently dropped. Output that cannot be parsed fails loudly with the raw
-text instead of reporting a fake pass.
+A file that is binary, oversized or over a budget is reported as **left out**, and
+a file the ignore rules cover is reported as **excluded as ignored** with the rule
+that matched — neither is ever silently dropped. Output that cannot be parsed
+fails loudly with the raw text instead of reporting a fake pass.
 
 ## Limits
 
@@ -142,6 +204,12 @@ text instead of reporting a fake pass.
 - A finding may cite a file outside the change set when the proof lives there (a
   caller, a definition); the reachability rule in its prompt still ties it to the
   change set.
+- Ignore patterns are matched against paths, and a pattern naming a directory
+  takes everything under it with it; a *file* named exactly like such a pattern
+  (`build/`) is therefore treated as the directory of that name.
+- `respectGitIgnore` consults the repository's rules for the **git** source; the
+  session-record source is filtered by the built-in list, the config file and what
+  you typed.
 
 ## Package layout
 

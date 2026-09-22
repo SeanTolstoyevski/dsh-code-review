@@ -1549,4 +1549,467 @@ function subdirectoryFixture() {
   assert.ok(!prompt.includes('\n+\n'), 'and was not rewritten into a bare +')
 }
 
+/**
+ * A repository with no ignore file of its own: a changed source file next to the
+ * junk every project produces. `vendor/lib/vendored.go` is tracked — committed
+ * by force, the mistake that makes `node_modules` show up in a diff — while the
+ * dependency tree, the bundle and the log are untracked.
+ */
+function noisyFixture() {
+  const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-noisy-'))
+  const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+  git(['init', '-q'])
+  writeFileSync(join(repo, 'app.go'), 'package app\n\nvar A = 1\n')
+  mkdirSync(join(repo, 'vendor', 'lib'), { recursive: true })
+  writeFileSync(join(repo, 'vendor', 'lib', 'vendored.go'), 'package vendored\n\nvar VENDOR_NEEDLE = 1\n')
+  git(['add', '.'])
+  git(['add', '-f', 'vendor/lib/vendored.go'])
+  git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
+  writeFileSync(join(repo, 'app.go'), 'package app\n\nvar A = 2\n')
+  writeFileSync(join(repo, 'vendor', 'lib', 'vendored.go'), 'package vendored\n\nvar VENDOR_NEEDLE = 2\n')
+  mkdirSync(join(repo, 'node_modules', 'dep'), { recursive: true })
+  writeFileSync(join(repo, 'node_modules', 'dep', 'index.js'), 'module.exports = "DEPENDENCY_NEEDLE"\n')
+  mkdirSync(join(repo, 'dist'), { recursive: true })
+  writeFileSync(join(repo, 'dist', 'bundle.js'), 'var BUNDLE_NEEDLE = 1\n')
+  writeFileSync(join(repo, 'debug.log'), 'LOG_NEEDLE\n')
+  return { repo, git }
+}
+
+/** The change-set junk a noisyFixture review must never have looked at. */
+const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VENDOR_NEEDLE']
+
+// 57 — the built-in list keeps dependencies, build output and logs out of the diff.
+{
+  const { repo } = noisyFixture()
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'source only')] })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  const payload = payloadOf(result.text)
+  const ignore = payload.stats.ignore
+  assert.equal(payload.stats.reviewed, 1, 'only the source file is reviewed')
+  assert.equal(payload.stats.files, 1, 'the ignored files are not part of the change set')
+  assert.deepEqual(payload.stats.skipped, [], 'an ignored file is not also reported as left out')
+  assert.equal(ignore.count, 4, 'the tracked vendored file and the three untracked ones')
+  assert.equal(ignore.builtIn, true)
+  assert.ok(ignore.builtInPatterns > 50, 'the built-in standard list is in force')
+  assert.deepEqual(
+    ignore.sample.map(item => item.file).sort(),
+    ['debug.log', 'dist/bundle.js', 'node_modules/dep/index.js', 'vendor/lib/vendored.go'],
+    'every excluded path is named',
+  )
+  assert.deepEqual(
+    Object.fromEntries(ignore.sample.map(item => [item.file, item.rule])),
+    {
+      'debug.log': '*.log',
+      'dist/bundle.js': 'dist/',
+      'node_modules/dep/index.js': 'node_modules/',
+      'vendor/lib/vendored.go': 'vendor/',
+    },
+    'each one is excluded by the rule the user can override',
+  )
+  const prompt = h.seen.prompts[0].messages[0].content[0].text
+  assert.ok(prompt.includes('+var A = 2'), 'the source change reached the reviewer')
+  for (const needle of NOISY_NEEDLES) {
+    assert.ok(!prompt.includes(needle), `nothing under an ignored path reached the prompt (${needle})`)
+  }
+  assert.ok(prompt.includes('- already excluded by the ignore rules'), 'the reviewer is told what was taken out')
+  assert.ok(result.text.includes('- excluded as ignored: 4 file(s)'), 'the report names them instead of hiding them')
+  assert.ok(result.text.includes('- ignore rules: built-in standard list'), 'and says which rules were in force')
+}
+
+// 58 — config patterns and typed ones add to the list, and `!` puts a path back.
+{
+  const { repo } = noisyFixture()
+  mkdirSync(join(repo, 'generated'), { recursive: true })
+  writeFileSync(join(repo, 'generated', 'code.go'), 'package generated\n\nvar GEN_NEEDLE = 1\n')
+
+  await withSettings({ ignored: ['generated/', '*.log'] }, async () => {
+    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'configured')] })
+    const payload = payloadOf((await h.invoke('')).text)
+    assert.equal(payload.stats.ignore.configured, 2, 'the config patterns are in force')
+    assert.ok(
+      payload.stats.ignore.sample.some(item => item.file === 'generated/code.go' && item.rule === 'generated/'),
+      'a configured pattern names itself in the report',
+    )
+    assert.ok(!h.seen.prompts[0].messages[0].content[0].text.includes('GEN_NEEDLE'), 'and keeps the path out')
+  })
+
+  // Typed on the command line: one pattern adds, one negation takes a built-in
+  // default back, one quoted pattern holds a space, and the rest of the line is
+  // still the focus message.
+  mkdirSync(join(repo, 'odd dir'), { recursive: true })
+  writeFileSync(join(repo, 'odd dir', 'note.md'), 'ODD_NEEDLE\n')
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'typed')] })
+  const result = await h.invoke('ignored=!dist/,generated/ ignored="odd dir/" kalan odak')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.focus, 'kalan odak', 'the focus message survives the ignore arguments')
+  assert.equal(payload.stats.ignore.typed, 3, 'all three typed patterns are in force')
+  assert.equal(payload.stats.reviewed, 2, 'the source file and the bundle the negation put back')
+  const prompt = h.seen.prompts[0].messages[0].content[0].text
+  assert.ok(prompt.includes('BUNDLE_NEEDLE'), '`!dist/` brings the build output back into the review')
+  assert.ok(!prompt.includes('DEPENDENCY_NEEDLE'), 'while the dependency tree stays out')
+  assert.ok(!prompt.includes('GEN_NEEDLE'), 'and the typed `generated/` keeps its path out too')
+  assert.ok(!prompt.includes('ODD_NEEDLE'), 'a quoted pattern with a space in it is one pattern, not two')
+}
+
+// 59 — the repository's own ignore rules are honored, tracked files included.
+{
+  const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-repoignore-'))
+  const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+  git(['init', '-q'])
+  writeFileSync(join(repo, '.gitignore'), 'generated/\n*.secret\n')
+  writeFileSync(join(repo, 'app.go'), 'package app\n\nvar A = 1\n')
+  mkdirSync(join(repo, 'generated'), { recursive: true })
+  writeFileSync(join(repo, 'generated', 'api.go'), 'package generated\n\nvar REPO_NEEDLE = 1\n')
+  git(['add', '.gitignore', 'app.go'])
+  git(['add', '-f', 'generated/api.go'])
+  git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
+  writeFileSync(join(repo, 'app.go'), 'package app\n\nvar A = 2\n')
+  writeFileSync(join(repo, 'generated', 'api.go'), 'package generated\n\nvar REPO_NEEDLE = 2\n')
+
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'own rules')] })
+  const result = await h.invoke('')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.stats.reviewed, 1, 'the tracked file the project itself ignores is out')
+  assert.equal(payload.stats.ignore.gitIgnore, true, 'the report says the repository rules were consulted')
+  assert.ok(
+    payload.stats.ignore.sample.some(item => item.file === 'generated/api.go'
+      && item.rule === "the repository's own ignore rules"),
+    'and names the reason',
+  )
+  assert.ok(!h.seen.prompts[0].messages[0].content[0].text.includes('REPO_NEEDLE'))
+
+  // A negation wins over the repository's own rules too: the user is the last word.
+  const over = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'rescued')] })
+  await over.invoke('ignored=!generated/api.go')
+  assert.ok(
+    over.seen.prompts[0].messages[0].content[0].text.includes('REPO_NEEDLE'),
+    'an explicit `!pattern` puts back what .gitignore took out',
+  )
+
+  await withSettings({ respectGitIgnore: false }, async () => {
+    const off = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'no repo rules')] })
+    const offPayload = payloadOf((await off.invoke('')).text)
+    assert.equal(offPayload.stats.ignore.gitIgnore, false, 'the repository rules can be turned off')
+    assert.equal(offPayload.stats.reviewed, 2, 'and then the tracked file is reviewed again')
+  })
+}
+
+// 60 — the built-in list can be turned off, from the config or from the command line.
+{
+  const { repo } = noisyFixture()
+  await withSettings({ ignoreDefaults: false }, async () => {
+    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'all of it')] })
+    const payload = payloadOf((await h.invoke('')).text)
+    assert.equal(payload.stats.ignore.builtIn, false)
+    assert.equal(payload.stats.ignore.count, 0, 'nothing is excluded once the list is off')
+    assert.equal(payload.stats.reviewed, 5, 'so the dependency tree, the bundle and the log are reviewed')
+    assert.ok(h.seen.prompts[0].messages[0].content[0].text.includes('DEPENDENCY_NEEDLE'))
+  })
+
+  // A typed argument beats the config file in both directions.
+  await withSettings({ ignoreDefaults: false }, async () => {
+    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'defaults back')] })
+    const result = await h.invoke('ignoreDefaults=true')
+    assert.equal(payloadOf(result.text).stats.ignore.builtIn, true, '`ignoreDefaults=true` wins over the config')
+    assert.equal(payloadOf(result.text).stats.reviewed, 1)
+  })
+}
+
+// 61 — what the ignore rules take out of the diff, the reader cannot put back.
+{
+  const { repo } = noisyFixture()
+  const hidden = 'node_modules/dep/index.js'
+  const h = harness({
+    cwd: repo,
+    hasEvent: false,
+    diffs: [],
+    script: [
+      {
+        toolCalls: [
+          { name: 'read_file', arguments: JSON.stringify({ path: hidden }) },
+          { name: 'search', arguments: JSON.stringify({ query: 'NEEDLE' }) },
+          { name: 'list_dir', arguments: '{"path":"."}' },
+        ],
+      },
+      answer('fail', [{
+        severity: 'major', category: 'correctness', file: hidden, line: 1,
+        title: 'Dependency defect', problem: 'a claim about code the review excluded',
+        impact: 'The reviewer would report on a dependency tree nobody asked about.',
+        trigger: 'A review that reads node_modules reaches this by ignoring the rules.',
+        suggestion: 'none', evidence: 'module.exports = "DEPENDENCY_NEEDLE"',
+      }], 'read the tree'),
+    ],
+  })
+  const result = await h.invoke('')
+  const tool = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(tool[0].isError, true, 'reading an ignored path is refused')
+  assert.ok(tool[0].content[0].text.includes("excluded by the review's ignore rules"), tool[0].content[0].text)
+  assert.ok(tool[0].content[0].text.includes('node_modules/'), 'and says which rule excluded it')
+  assert.ok(!tool[0].content[0].text.includes('DEPENDENCY_NEEDLE'), 'the file is never read at all')
+  assert.ok(tool[1].content[0].text.includes('no match for "NEEDLE"'), 'a search cannot see into an ignored path')
+  for (const needle of NOISY_NEEDLES) {
+    assert.ok(!tool[1].content[0].text.includes(needle), `no ignored content reaches the search result (${needle})`)
+  }
+  assert.ok(!tool[2].content[0].text.includes('node_modules'), 'list_dir hides an ignored directory')
+  assert.ok(!tool[2].content[0].text.includes('bundle.js'), 'and ignored files with it')
+  assert.ok(tool[2].content[0].text.includes('app.go'), 'while the source file is still listed')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 0, 'a finding about an ignored path cannot be published')
+  assert.equal(payload.withheld.length, 1)
+  assert.ok(payload.withheld[0].reason.includes('not one the reviewer could see'), payload.withheld[0].reason)
+}
+
+// 62 — the session record is filtered by the same rules, before any diff is fetched.
+{
+  const files = [
+    { path: 'internal/chessx/board.go', display: 'internal/chessx/board.go', added: 2, deleted: 1 },
+    { path: 'node_modules/dep/index.js', display: 'node_modules/dep/index.js', added: 1, deleted: 0 },
+  ]
+  const h = harness({
+    summary: { turn: 3, cwd: WS, total: 2, added: 3, deleted: 1, files },
+    diffs: [TEXT_DIFF],
+    script: [answer('pass', [], 'session record')],
+  })
+  const result = await h.invoke('session')
+  assert.equal(result.kind, 'success', result.text)
+  const payload = payloadOf(result.text)
+  assert.equal(payload.stats.reviewed, 1)
+  assert.deepEqual(payload.stats.skipped, [], 'the ignored file was never asked for')
+  assert.equal(payload.stats.files, 1, 'and never counted as part of the change set')
+  assert.deepEqual(payload.stats.ignore.sample, [{ file: 'node_modules/dep/index.js', rule: 'node_modules/' }])
+  const prompt = h.seen.prompts[0].messages[0].content[0].text
+  const diffs = prompt.slice(prompt.indexOf('## Unified diffs'), prompt.indexOf('## Language'))
+  assert.ok(prompt.includes('already excluded by the ignore rules'), 'the exclusion is reported to the reviewer')
+  assert.ok(!diffs.includes('node_modules'), 'and the ignored file never entered the diffs')
+}
+
+// 63 — a change set that is entirely ignored says so, and is never called clean.
+{
+  const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-onlyignored-'))
+  const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+  git(['init', '-q'])
+  writeFileSync(join(repo, 'seed.go'), 'package seed\n\nvar S = 1\n')
+  git(['add', '.'])
+  git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
+  mkdirSync(join(repo, 'node_modules', 'dep'), { recursive: true })
+  writeFileSync(join(repo, 'node_modules', 'dep', 'index.js'), 'module.exports = 1\n')
+
+  const h = harness({
+    cwd: repo,
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [answer('pass', [], 'never asked')],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'error')
+  assert.ok(result.text.includes('every one is excluded by the ignore rules'), result.text)
+  assert.ok(result.text.includes('node_modules/dep/index.js'), 'the message names what it left out')
+  assert.ok(result.text.includes('ignoreDefaults'), 'and how to put it back')
+  assert.equal(h.seen.prompts.length, 0, 'no reviewer call is spent on an empty change set')
+}
+
+// 64 — the pattern syntax: anchoring, `**`, classes and directory patterns.
+{
+  const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-patterns-'))
+  const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+  git(['init', '-q'])
+  const paths = [
+    'keep.go', 'gen/a.go', 'sub/gen/b.go', 'docs/one.md', 'docs/deep/two.md', 'tmp/file1.go',
+  ]
+  for (const path of paths) {
+    mkdirSync(dirname(join(repo, path)), { recursive: true })
+    writeFileSync(join(repo, path), `package p\n\nvar ${path.replace(/\W/g, '_')} = 1\n`)
+  }
+  git(['add', '.'])
+  git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
+  for (const path of paths) {
+    writeFileSync(join(repo, path), `package p\n\nvar ${path.replace(/\W/g, '_')} = 2\n`)
+  }
+
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'patterns')] })
+  const result = await h.invoke('ignored=/gen/,file[0-9].go,docs/**/*.md,sub/gen/,!sub/gen/b.go')
+  const payload = payloadOf(result.text)
+  const byFile = Object.fromEntries(payload.stats.ignore.sample.map(item => [item.file, item.rule]))
+  assert.deepEqual(byFile, {
+    'docs/deep/two.md': 'docs/**/*.md',
+    'docs/one.md': 'docs/**/*.md',
+    'gen/a.go': '/gen/',
+    'tmp/file1.go': 'file[0-9].go',
+  }, 'a leading slash anchors, `**/` spans directories, a class matches one character')
+  assert.equal(payload.stats.reviewed, 2, 'keep.go and the file a later `!` put back')
+  const prompt = h.seen.prompts[0].messages[0].content[0].text
+  assert.ok(prompt.includes('sub/gen/b.go'), 'the negation overrides the directory pattern before it')
+  assert.ok(!prompt.includes('sub/gen/a.go') && prompt.includes('gen/a.go'), 'the root-anchored pattern spared sub/gen')
+}
+
+// 65 — the card reports the count and the rule, and still cannot send anything.
+{
+  const report = {
+    verdict: 'pass',
+    summary: 'A summary.',
+    findings: [],
+    withheld: [],
+    stats: {
+      files: 1,
+      added: 1,
+      deleted: 0,
+      reviewed: 1,
+      skipped: [],
+      ignore: {
+        count: 2,
+        sample: [
+          { file: 'node_modules/a.js', rule: 'node_modules/' },
+          { file: 'dist/b.js', rule: 'dist/' },
+        ],
+      },
+    },
+    reviewer: { provider: 'p', model: 'm' },
+  }
+  const text = `## Code review — PASS\n\nA summary.\n\n${MARKER}\n\`\`\`json\n${JSON.stringify(report)}\n\`\`\`\n`
+  const card = await renderCard({ kind: 'success', text })
+  // The meta line is longer than the recorder keeps, so what proves the count
+  // here is the section itself: the label carries it and each row names its rule.
+  assert.ok(card.texts.includes('label.ignored (2)'), 'the section names the count')
+  assert.ok(card.texts.includes('node_modules/a.js — node_modules/'), 'and shows the rule behind each file')
+  assert.ok(card.texts.includes('dist/b.js — dist/'))
+  assert.deepEqual(
+    card.buttons,
+    ['action.copyReport', 'toggle.hide'],
+    'the ignored section adds no control that could send anything',
+  )
+}
+
+// 66 — the reader answers under the repository rules the change set was filtered by.
+{
+  const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-readerignore-'))
+  const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+  git(['init', '-q'])
+  writeFileSync(join(repo, '.gitignore'), 'generated/\n')
+  writeFileSync(join(repo, 'app.go'), 'package app\n\nvar A = 1\n')
+  mkdirSync(join(repo, 'generated'), { recursive: true })
+  writeFileSync(join(repo, 'generated', 'api.go'), 'package generated\n\nvar REPO_NEEDLE = 1\n')
+  git(['add', '.gitignore', 'app.go'])
+  git(['add', '-f', 'generated/api.go'])
+  git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
+  writeFileSync(join(repo, 'app.go'), 'package app\n\nvar A = 2\n')
+  writeFileSync(join(repo, 'generated', 'api.go'), 'package generated\n\nvar REPO_NEEDLE = 2\n')
+
+  const hidden = 'generated/api.go'
+  const h = harness({
+    cwd: repo,
+    hasEvent: false,
+    diffs: [],
+    script: [
+      {
+        toolCalls: [
+          { name: 'read_file', arguments: JSON.stringify({ path: hidden }) },
+          { name: 'search', arguments: JSON.stringify({ query: 'REPO_NEEDLE' }) },
+          { name: 'list_dir', arguments: '{"path":"."}' },
+          { name: 'list_dir', arguments: '{"path":"generated"}' },
+        ],
+      },
+      answer('fail', [{
+        severity: 'major', category: 'correctness', file: hidden, line: 3,
+        title: 'Ignored file still readable', problem: 'a claim about a file the change set excluded',
+        impact: 'A file the review took out of the diff comes back in through a read.',
+        trigger: 'Asking the reader for a path the repository ignores reaches this.',
+        suggestion: 'none', evidence: 'var REPO_NEEDLE = 2',
+      }], 'read it'),
+    ],
+  })
+  const result = await h.invoke('')
+  const tool = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(tool[0].isError, true, 'reading a path only the repository ignores is refused')
+  assert.ok(tool[0].content[0].text.includes("excluded by the review's ignore rules"), tool[0].content[0].text)
+  assert.ok(tool[0].content[0].text.includes("the repository's own ignore rules"), 'and names that layer')
+  assert.ok(!tool[0].content[0].text.includes('REPO_NEEDLE'), 'the file is never read at all')
+  assert.ok(tool[1].content[0].text.includes('no match for "REPO_NEEDLE"'), 'and a search cannot find it')
+  // The repository layer is a list of the paths git itself reports, so a
+  // directory name can still be listed; what must never show up is the file.
+  assert.ok(!tool[2].content[0].text.includes('api.go'), 'the ignored file is in no listing')
+  assert.ok(tool[3].content[0].text.includes('0 entries'), 'and its own directory lists empty')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 0, 'so no finding can be built on it')
+  assert.equal(payload.withheld.length, 1)
+  assert.ok(payload.withheld[0].reason.includes('not one the reviewer could see'), payload.withheld[0].reason)
+}
+
+// 67 — the config file is found under the harness home, never under the cwd.
+{
+  const home = mkdtempSync(join(tmpdir(), 'dsh-code-review-default-home-'))
+  mkdirSync(join(home, '.dsh', 'code-review'), { recursive: true })
+  writeFileSync(join(home, '.dsh', 'code-review', 'config.json'), JSON.stringify({ maxFiles: 1 }))
+  const previous = { DSH_HOME: process.env.DSH_HOME, HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+  // `dsh web` is started from wherever the user is, and its process may carry no
+  // DSH_HOME at all; the home is then `~/.dsh`, which is what os.homedir() reads.
+  delete process.env.DSH_HOME
+  process.env.HOME = home
+  process.env.USERPROFILE = home
+  try {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
+    const payload = payloadOf((await h.invoke('')).text)
+    assert.equal(payload.stats.reviewed, 1, 'the config under ~/.dsh was read')
+    assert.deepEqual(
+      payload.stats.skipped,
+      [{ file: 'assets/logo.png', reason: 'over-file-limit' }],
+      'and its maxFiles decided the review',
+    )
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+// 68 — session scope reports the session's own ignored file, not "nothing differs".
+{
+  const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-sessionignored-'))
+  const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+  git(['init', '-q'])
+  writeFileSync(join(repo, '.gitignore'), 'dist/\n')
+  mkdirSync(join(repo, 'src'), { recursive: true })
+  mkdirSync(join(repo, 'dist'), { recursive: true })
+  writeFileSync(join(repo, 'src', 'app.js'), 'export const a = 1\n')
+  writeFileSync(join(repo, 'dist', 'bundle.js'), 'var bundle = 1\n')
+  git(['add', '.gitignore', 'src/app.js'])
+  git(['add', '-f', 'dist/bundle.js'])
+  git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
+  // The session edits the committed, ignored bundle; someone else edits src.
+  writeFileSync(join(repo, 'dist', 'bundle.js'), 'var bundle = 2\n')
+  writeFileSync(join(repo, 'src', 'app.js'), 'export const a = 2\n')
+  const root = realpathSync(repo)
+
+  const h = harness({
+    cwd: repo,
+    hasEvent: false,
+    diffs: [],
+    toolCalls: [{ name: 'write', arguments: { file_path: join(root, 'dist', 'bundle.js') } }],
+    script: [answer('pass', [], 'never asked')],
+  })
+  const result = await h.invoke('session')
+  assert.equal(result.kind, 'error', result.text)
+  assert.ok(result.text.includes('excluded by the ignore rules'), result.text)
+  assert.ok(result.text.includes('dist/bundle.js (dist/)'), 'the session file and its rule are named')
+  assert.ok(!result.text.includes('none of them differs'), 'and the change is never called a no-op')
+  assert.equal(h.seen.prompts.length, 0, 'no reviewer call is spent on it')
+
+  // An ignored file the session never touched is not this run's business: a
+  // session review that does have work reports no exclusion at all.
+  writeFileSync(join(repo, 'src', 'app.js'), 'export const a = 3\n')
+  const own = harness({
+    cwd: repo,
+    hasEvent: false,
+    diffs: [],
+    toolCalls: [{ name: 'write', arguments: { file_path: join(root, 'src', 'app.js') } }],
+    script: [answer('pass', [], 'session file only')],
+  })
+  const second = await own.invoke('session')
+  assert.equal(second.kind, 'success', second.text)
+  const payload = payloadOf(second.text)
+  assert.equal(payload.stats.reviewed, 1, 'the session file is reviewed')
+  assert.equal(payload.stats.ignore.count, 0, "another file's exclusion is not reported as this run's")
+}
+
 console.log('selftest: all checks passed')
