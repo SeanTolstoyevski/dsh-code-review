@@ -77,6 +77,8 @@ const READ_ONLY_FILE = 'internal/play/move.go'
  * @param options.cwd - the session workspace the plugin reads.
  * @param options.messages - what the session derives as its conversation.
  * @param options.toolCalls - `{ name, arguments }` entries logged as this session's tool calls.
+ * @param options.modelInfo - what `ctx.llm.resolveModelInfo` returns; omitted exposes no such method.
+ * @param options.modelInfoThrows - makes `resolveModelInfo` reject, as an unregistered route does.
  */
 function harness({
   summary,
@@ -92,9 +94,11 @@ function harness({
   cwd = WS,
   messages = [{ role: 'user', content: [{ type: 'text', text: 'Board ı hesapla' }] }],
   toolCalls = [],
+  modelInfo,
+  modelInfoThrows = false,
 }) {
   const subprocess = git ? realSubprocess() : undefined
-  const seen = { prompts: [], steer: [], inject: [], steerAttempts: 0 }
+  const seen = { prompts: [], steer: [], inject: [], steerAttempts: 0, modelInfo: [] }
   let definition
   let call = 0
   const ctx = {
@@ -106,6 +110,13 @@ function harness({
       diff: async (_id, _seq, index) => diffs[index],
     },
     llm: {
+      ...modelInfo === undefined && !modelInfoThrows ? {} : {
+        async resolveModelInfo(provider, model) {
+          seen.modelInfo.push({ provider, model })
+          if (modelInfoThrows) throw new Error('no adapter for this route')
+          return modelInfo
+        },
+      },
       stream(request) {
         seen.prompts.push(request)
         const step = script[Math.min(call, script.length - 1)]
@@ -2696,6 +2707,81 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.findings[0].severity, 'nit', 'the weakest end of the default table is unchanged')
   assert.equal(payload.verdict, 'warn', 'and it still lands as a warning, never as a failure')
+}
+
+// 89 — the thinking level of a run: the config file and the mode preset carry
+// it, the command line overrides both, an empty layer presets nothing, and a
+// level the model does not offer is refused before a single call is spent.
+{
+  // A fresh file carries the key, and a run that names no level sends none at
+  // all — the provider's own default is what decides there.
+  await withEmptyHome(async home => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+    const created = JSON.parse(readFileSync(settingsPath(home), 'utf8'))
+    assert.equal(created.reasoningEffort, '', 'the created config carries the key')
+    const text = (await h.invoke('')).text
+    assert.equal(h.seen.prompts[0].reasoningEffort, undefined, 'an empty setting sends no level')
+    assert.equal(payloadOf(text).reviewer.reasoningEffort, undefined, 'and the payload claims none')
+    assert.ok(!text.includes('thinking:'), 'nor does the report name a level nobody chose')
+  })
+
+  // The mode's preset beats the file's value; what is typed beats them both.
+  await withSettings({
+    reasoningEffort: 'low',
+    modes: { cr: { settings: { reasoningEffort: 'max' } } },
+  }, async () => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+    const text = (await h.invoke('')).text
+    assert.equal(h.seen.prompts[0].reasoningEffort, 'max', "the mode's preset beats the file's value")
+    assert.equal(payloadOf(text).reviewer.reasoningEffort, 'max', 'and reaches the payload the card draws')
+    assert.ok(text.includes('thinking: max'), 'and the report the user copies')
+
+    const typed = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+    await typed.invoke('reasoningEffort=off')
+    assert.equal(typed.seen.prompts[0].reasoningEffort, 'off', 'and what is typed beats them both')
+  })
+
+  // An empty layer states no preference: it never erases the value below it.
+  await withSettings({
+    reasoningEffort: 'low',
+    modes: { cr: { settings: { reasoningEffort: '' } } },
+  }, async () => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+    await h.invoke('')
+    assert.equal(h.seen.prompts[0].reasoningEffort, 'low', 'an empty preset leaves the file in force')
+  })
+
+  // A level the model does not offer is refused with the levels it does, and
+  // the refusal costs no model call — the rule an unknown mode already follows.
+  await withSettings({ reasoningEffort: 'ultra' }, async () => {
+    const offered = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      modelInfo: { reasoning: { efforts: [{ id: 'off', name: 'Off' }, { id: 'high', name: 'High' }] } },
+    })
+    const refused = await offered.invoke('')
+    assert.equal(refused.kind, 'error', refused.text)
+    assert.ok(refused.text.includes('off, high'), 'the levels it does offer are named')
+    assert.ok(refused.text.includes('deepseek-official/deepseek-flash'), 'and the route the refusal is about')
+    assert.equal(offered.seen.prompts.length, 0, 'and nothing is spent on a call that cannot work')
+
+    const bare = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], modelInfo: {} })
+    const bareResult = await bare.invoke('')
+    assert.equal(bareResult.kind, 'error', 'a model with no reasoning levels at all is refused too')
+    assert.ok(bareResult.text.includes('declares no reasoning levels'), bareResult.text)
+    assert.equal(bare.seen.prompts.length, 0)
+
+    // A route the adapter cannot describe is left to the call itself: the
+    // setting still reaches the request, exactly as it did before the check.
+    const unknown = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      modelInfoThrows: true,
+    })
+    const result = await unknown.invoke('')
+    assert.equal(result.kind, 'success', result.text)
+    assert.equal(unknown.seen.prompts[0].reasoningEffort, 'ultra', 'an undescribable route is not second-guessed')
+  })
 }
 
 console.log('selftest: all checks passed')

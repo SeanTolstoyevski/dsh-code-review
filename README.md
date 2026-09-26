@@ -38,7 +38,7 @@ installed with it: the package is plain JavaScript with no dependencies.
 ## Use
 
 ```
-/review [full|session] [mode=<id>] [provider=<id>] [model=<id>] [language=<code>] [gitRev=<rev>] [source=auto|git|session] [ignored=<pattern,…>] [focus message]
+/review [full|session] [mode=<id>] [provider=<id>] [model=<id>] [reasoningEffort=<id>] [language=<code>] [gitRev=<rev>] [source=auto|git|session] [ignored=<pattern,…>] [focus message]
 ```
 
 - `/review` or `/review full` — every uncommitted change in the **repository**
@@ -50,6 +50,12 @@ installed with it: the package is plain JavaScript with no dependencies.
   that does not resolve is refused before any model call, and the error lists the
   modes that do;
 - `/review session` — only the files this session wrote or edited;
+- `reasoningEffort=<id>` — the thinking level the reviewer runs at, as the
+  provider names it (`reasoningEffort=max`, `reasoningEffort=off`). It beats what
+  the config file says, per mode or globally; a level the model does not offer is
+  refused before any model call, with the levels it does offer named. Leave it out
+  — in the command and in the file — and the request carries no level at all, so
+  the provider's own default applies;
 - `ignored=<pattern>[,…]` — ignore patterns for this run, on top of the built-in
   list and the config file; repeat the key to add more, and prefix a pattern with
   `!` to put a path back (`/review ignored=fixtures/,!dist/`);
@@ -117,7 +123,7 @@ shape of an entry — every key is optional, and this example is a working mode:
 | `fields` | The narrative fields of one finding, in the order the report and the card show them: `key` (required), `label` (empty renders the text bare), `required`, `block` (render as quoted code), `guide` (what the field must contain, quoted in the contract). `severity`, `category`, `file`, `line` and `title` are the finding's structure and cannot be field keys. |
 | `severities` | The vocabulary the reviewer may use and the verdict each forces: `id`, `label`, `tone` (`error`, `warn`, `success`, `muted`), `verdict` (`fail`, `warn`, `pass`) and `meaning` (quoted in the contract, so an arbitrary vocabulary still defines itself). The verdict of a run is the strongest one its surviving findings force. |
 | `verdicts` | What the mode calls `pass`, `warn` and `fail` — `sound`, `worth discussing`, `decide before merge`. The chip keeps the machine verdict's colour. |
-| `settings` | A preset of the run settings below: the mode's values win over the file's own and lose to what you type after `/review`. |
+| `settings` | A preset of the run settings below: the mode's values win over the file's own and lose to what you type after `/review`. `"settings": { "reasoningEffort": "max" }` is how one mode thinks harder than the rest without changing the global setting. An empty value presets nothing: the layer below stays in force. |
 
 Two rules are not negotiable. **`evidence` is required in every mode**: leave it
 out of `fields` and it is appended, set `required: false` and it is put back.
@@ -269,6 +275,7 @@ command surface.
   "maxHintChars": 600,
   "maxTokens": 50000,
   "temperature": 0.1,
+  "reasoningEffort": "",
   "timeoutMs": 600000,
   "ignored": [],
   "ignoreDefaults": true,
@@ -291,6 +298,7 @@ command surface.
 | `ignoreDefaults` | `true` (default): the built-in standard list applies. `false` reviews dependency trees and build output like anything else. |
 | `respectGitIgnore` | `true` (default): the repository's own ignore rules are honored too, tracked files included. `false` reviews them. |
 | `maxTokens`, `temperature`, `timeoutMs` | Output cap, sampling and the budget for the whole run. A first call that fails is retried once without project access and with the output cap lowered to 8192 or to the configured value when that is smaller; the report says the run was degraded. |
+| `reasoningEffort` | The thinking level handed to the reviewer, as the adapter names it — `off`, `low`, `high`, `max` on DeepSeek. Empty (the default) sends no level, so the provider's own default decides; that is what every run did before this key existed. A mode can preset it (`modes.cr.settings.reasoningEffort`) and `reasoningEffort=` on the command line beats them both. A level the selected model does not offer is refused before any model call, and the offered levels are listed. |
 
 `modes` is the one key the file holds that the table above does not list: an
 object of mode entries, documented under [Modes](#modes), with the built-in modes
@@ -301,6 +309,11 @@ beat this file, which beats the release default. A mode is a preset: `arc`'s
 `maxToolCalls: 60` applies even if you set a global `maxToolCalls`, and changing
 it means editing `modes.arc.settings.maxToolCalls` — or deleting the mode's
 `maxToolCalls` and setting the global one, since a mode without it inherits.
+The same holds for `reasoningEffort`: `modes.cr.settings.reasoningEffort: "max"`
+makes every code review think at `max` while `arc` keeps whatever the file says,
+and `reasoningEffort=low` on one command overrides both.
+An empty value is not a value: it presets nothing and never erases the layer
+below it, so a mode that writes `reasoningEffort: ""` inherits the file's.
 
 ## Findings
 

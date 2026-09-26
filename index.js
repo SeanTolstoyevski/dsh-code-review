@@ -106,6 +106,7 @@ export const DEFAULTS = {
   maxHintChars: 600,
   maxTokens: 50_000,
   temperature: 0.1,
+  reasoningEffort: '',
   /** Covers the whole reader loop, not one model call. */
   timeoutMs: 600_000,
   /** Extra ignore patterns, on top of the built-in standard list. */
@@ -957,7 +958,7 @@ function loadSettings(log) {
 
 /** Keys accepted as leading `key=value` arguments of the command. */
 const ARG_KEYS = new Set([
-  'mode', 'provider', 'model', 'language', 'gitRev', 'source',
+  'mode', 'provider', 'model', 'reasoningEffort', 'language', 'gitRev', 'source',
   'ignored', 'ignore', 'ignoreDefaults', 'respectGitIgnore',
 ])
 
@@ -1007,6 +1008,50 @@ function firstNonEmpty(...values) {
     if (typeof value === 'string' && value !== '') return value
   }
   return undefined
+}
+
+/**
+ * The thinking level this run asks the reviewer to reason at: what was typed
+ * after `/review`, else the mode's preset, else the file's own value, else none
+ * at all. An empty layer states no preference — it never shadows a value the
+ * layer below it carries — and `undefined` means the request leaves the field
+ * out entirely, so the provider's default effort is the one that runs.
+ *
+ * The three layers are read apart rather than off the merged settings object on
+ * purpose: `{ ...fileSettings, ...mode.settings }` would let an empty mode
+ * preset erase a level the user wrote in the file.
+ */
+function resolveReasoningEffort(mode, fileSettings, overrides) {
+  return firstNonEmpty(
+    modeText(overrides.reasoningEffort),
+    modeText(mode.settings.reasoningEffort),
+    modeText(fileSettings.reasoningEffort),
+  )
+}
+
+/**
+ * A thinking level the model does not offer is refused before any call, with
+ * the levels it does offer named — the rule an unknown `mode=` already follows.
+ * The check is skipped when the adapter cannot be asked (an unregistered route,
+ * a middleware-served one, a Host that exposes no model metadata): there the
+ * call itself is the judge, exactly as it was before this setting existed.
+ */
+async function checkReasoningEffort(ctx, route, effort, signal) {
+  if (effort === undefined || typeof ctx.llm.resolveModelInfo !== 'function') return undefined
+  let info
+  try {
+    info = await ctx.llm.resolveModelInfo(route.provider, route.model, signal)
+  } catch {
+    return undefined
+  }
+  const efforts = info?.reasoning?.efforts
+  if (!Array.isArray(efforts) || efforts.length === 0) {
+    return `${route.provider}/${route.model} declares no reasoning levels, so reasoningEffort "${effort}" cannot be used.` +
+      ` Delete "reasoningEffort" in ${configPath()} or drop reasoningEffort= from the command.`
+  }
+  if (efforts.some(entry => entry?.id === effort)) return undefined
+  return `reasoningEffort "${effort}" is not offered by ${route.provider}/${route.model} — available: ${efforts.map(entry => entry.id).join(', ')}.` +
+    ` Fix "reasoningEffort" in ${configPath()} or drop reasoningEffort= from the command.`
 }
 
 function clamp(text, max) {
@@ -2017,6 +2062,8 @@ async function callModel(ctx, route, settings, messages, tools, signal, system) 
     signal,
   }
   if (tools !== undefined) request.tools = tools
+  // Absent when no layer asked for a level: the provider's default then runs.
+  if (route.reasoningEffort !== undefined) request.reasoningEffort = route.reasoningEffort
 
   let text = ''
   const calls = new Map()
@@ -2435,6 +2482,15 @@ function verdictFromFindings(findings, mode) {
   return verdict
 }
 
+/**
+ * The thinking level, when one was asked for, as both the report and the notice
+ * write it. A run that asked for nothing says nothing: the level in force is the
+ * provider's own default, and naming it here would claim a choice nobody made.
+ */
+function effortNote(route) {
+  return route.reasoningEffort === undefined ? '' : ` · thinking: ${route.reasoningEffort}`
+}
+
 function renderReport({ verdict, summary, findings, withheld, stats, route, mode }) {
   const counts = countBySeverity(findings, mode)
   const head = mode.verdicts[verdict] ?? verdict.toUpperCase()
@@ -2467,7 +2523,7 @@ function renderReport({ verdict, summary, findings, withheld, stats, route, mode
     ...(stats.context === undefined || stats.context.calls === 0
       ? []
       : [`- project context read: ${stats.context.calls} tool call(s), ${stats.context.files.length} file(s)`]),
-    `- reviewer: ${route.provider}/${route.model}` +
+    `- reviewer: ${route.provider}/${route.model}${effortNote(route)}` +
       (stats.reviewerFallback === true ? ' · degraded retry (no project access, smaller output cap)' : ''),
   ]
   if (withheld.length > 0) {
@@ -2530,7 +2586,7 @@ function renderAgentNotice({ verdict, summary, findings, withheld, stats, route,
     ...(stats.ignore === undefined || stats.ignore.count === 0
       ? []
       : [`excluded by the ignore rules before the review: ${stats.ignore.count} file(s) — ${ignoreSampleText(stats.ignore)}`]),
-    `reviewer: ${route.provider}/${route.model}`,
+    `reviewer: ${route.provider}/${route.model}${effortNote(route)}`,
     ...(stats.recordBehind > 0
       ? [`note: this reviews turn ${stats.turn}; ${stats.recordBehind} newer recorded turn(s) have no comparison in this Host process`]
       : []),
@@ -2597,7 +2653,7 @@ export function apply(ctx) {
   ctx.effect(() => ctx.commands.register({
     name: 'review',
     description: 'Review the changes of this workspace in one of its modes and show a report card.',
-    input: { hint: '[full|session] [mode=<id>] [provider=<id>] [model=<id>] [ignored=<pattern,…>] [focus message]' },
+    input: { hint: '[full|session] [mode=<id>] [provider=<id>] [model=<id>] [reasoningEffort=<id>] [ignored=<pattern,…>] [focus message]' },
     handler: async ({ agent, rawInput, signal }) => {
       const invocation = parseInvocation(rawInput)
       const overrides = invocation.overrides
@@ -2626,6 +2682,17 @@ export function apply(ctx) {
       if (reviewerProvider === undefined || reviewerModel === undefined) {
         return { kind: 'error', text: `code-review: no reviewer route — set "provider"/"model" in ${configPath()} or pass provider=… model=… .` }
       }
+
+      // The route is the whole model selection — who reviews, and how hard it
+      // thinks — so everything downstream reads one object.
+      const reasoningEffort = resolveReasoningEffort(mode, fileSettings, overrides)
+      const route = {
+        provider: reviewerProvider,
+        model: reviewerModel,
+        ...reasoningEffort === undefined ? {} : { reasoningEffort },
+      }
+      const effortFailure = await checkReasoningEffort(ctx, route, reasoningEffort, signal)
+      if (effortFailure !== undefined) return { kind: 'error', text: `code-review: ${effortFailure}` }
 
       const limits = {
         maxFiles: positiveInt(settings.maxFiles, DEFAULTS.maxFiles),
@@ -2752,7 +2819,6 @@ export function apply(ctx) {
       })
       const system = systemPromptFor(mode)
 
-      const route = { provider: reviewerProvider, model: reviewerModel }
       const readerOn = settings.projectAccess === true
       const maxToolCalls = positiveInt(settings.maxToolCalls, DEFAULTS.maxToolCalls)
       const timeoutMs = positiveInt(settings.timeoutMs, DEFAULTS.timeoutMs)
@@ -2769,6 +2835,7 @@ export function apply(ctx) {
       )
       log.info(
         `reviewing ${stats.reviewed}/${stats.files} file(s) (${stats.scope} scope) via ${route.provider}/${route.model}` +
+        (route.reasoningEffort === undefined ? '' : ` (thinking: ${route.reasoningEffort})`) +
         (readerOn ? ` with read-only project access (up to ${maxToolCalls} reads)` : '') +
         (focus === '' ? '' : ` · focus: ${clamp(focus, 80)}`),
       )

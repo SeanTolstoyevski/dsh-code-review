@@ -61,6 +61,7 @@ window.__ModuleLoader__.load({
       'label.ignored': 'Excluded by the ignore rules',
       'label.withheld': 'Withheld as unprovable',
       'label.reviewer': 'reviewer',
+      'label.thinking': 'thinking',
       'empty.findings': 'No proven findings — nothing here stands up as worth reporting.',
       'stat.files': 'files',
       'stat.lines': 'lines',
@@ -89,6 +90,7 @@ window.__ModuleLoader__.load({
       'label.ignored': '被忽略规则排除',
       'label.withheld': '因无法证实而扣留',
       'label.reviewer': '审核模型',
+      'label.thinking': '思考等级',
       'empty.findings': '没有可证实的发现——这里没有值得报告的问题。',
       'stat.files': '个文件',
       'stat.lines': '行',
@@ -489,7 +491,12 @@ window.__ModuleLoader__.load({
       const findings = Array.isArray(payload.findings) ? payload.findings : []
       const mode = modeOf(payload)
       const reviewer = payload.reviewer
-      const subtitle = `${countLine(payload, t, mode)}${reviewer ? ` · ${t('label.reviewer')} ${reviewer.provider}/${reviewer.model}` : ''}`
+      // The level is shown only when the run asked for one: a review that left
+      // the choice to the provider says nothing rather than claiming a level.
+      const thinking = typeof reviewer?.reasoningEffort === 'string' && reviewer.reasoningEffort !== ''
+        ? ` · ${t('label.thinking')} ${reviewer.reasoningEffort}`
+        : ''
+      const subtitle = `${countLine(payload, t, mode)}${reviewer ? ` · ${t('label.reviewer')} ${reviewer.provider}/${reviewer.model}${thinking}` : ''}`
       // The verdict chip says the mode's own word for the answer — `fail` for a
       // code review, `decide before merge` for an architecture review — while the
       // tone stays the machine verdict, so the card reads the same at a glance.
