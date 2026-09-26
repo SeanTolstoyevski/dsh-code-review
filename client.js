@@ -7,6 +7,11 @@
  * one fenced JSON payload after `<!-- code-review:payload -->`. A card that
  * cannot parse the payload falls back to the raw report text.
  *
+ * The card is mode-agnostic: the Host half sends the mode's label, its severity
+ * vocabulary and the ordered field list of one finding, and the card draws what
+ * it was sent. It knows no particular mode, so a mode a user wrote under `modes`
+ * in `config.json` renders exactly like `cr` or `arc` does.
+ *
  * The card is where the review is read and taken away. It renders the report and
  * offers a copy action — the whole report, or one finding — and nothing else: no
  * button sends anything to the agent, because a review is a decision aid and the
@@ -21,7 +26,31 @@ window.__ModuleLoader__.load({
 
     const NS = 'code-review'
     const MARKER = '<!-- code-review:payload -->'
-    const SEVERITIES = ['blocker', 'major', 'minor', 'nit']
+
+    /**
+     * What the card draws when a payload does not describe its mode — a payload
+     * from another release, or the raw fallback face. It carries the code-review
+     * vocabulary the plugin shipped before modes, labels included, so the card
+     * never shows a blank finding.
+     */
+    const DEFAULT_MODE = {
+      id: 'cr',
+      label: 'Code review',
+      verdicts: {},
+      severities: [
+        { id: 'blocker', label: 'blocker', tone: 'error' },
+        { id: 'major', label: 'major', tone: 'warn' },
+        { id: 'minor', label: 'minor', tone: 'muted' },
+        { id: 'nit', label: 'nit', tone: 'muted' },
+      ],
+      fields: [
+        { key: 'problem', label: '', block: false },
+        { key: 'impact', label: 'Impact', block: false },
+        { key: 'trigger', label: 'How it is reached', block: false },
+        { key: 'suggestion', label: 'Fix', block: false },
+        { key: 'evidence', label: 'Evidence', block: true },
+      ],
+    }
 
     const en = {
       'title': 'Code review',
@@ -30,13 +59,10 @@ window.__ModuleLoader__.load({
       'label.findings': 'Findings',
       'label.skipped': 'Left out of the review',
       'label.ignored': 'Excluded by the ignore rules',
-      'label.fix': 'Fix',
-      'label.impact': 'Impact',
-      'label.trigger': 'How it is reached',
-      'label.evidence': 'Evidence from the diff',
       'label.withheld': 'Withheld as unprovable',
       'label.reviewer': 'reviewer',
-      'empty.findings': 'No proven findings — nothing in this diff stands up as a defect.',
+      'label.thinking': 'thinking',
+      'empty.findings': 'No proven findings — nothing here stands up as worth reporting.',
       'stat.files': 'files',
       'stat.lines': 'lines',
       'stat.reviewed': 'reviewed',
@@ -45,10 +71,6 @@ window.__ModuleLoader__.load({
       'stat.findings': 'findings',
       'stat.withheld': 'withheld',
       'stat.reads': 'context reads',
-      'severity.blocker': 'blocker',
-      'severity.major': 'major',
-      'severity.minor': 'minor',
-      'severity.nit': 'nit',
       'toggle.hide': 'Collapse',
       'toggle.show': 'Expand',
       'raw.fallback': 'Structured payload unavailable — showing the report text.',
@@ -66,13 +88,10 @@ window.__ModuleLoader__.load({
       'label.findings': '问题清单',
       'label.skipped': '未纳入审核',
       'label.ignored': '被忽略规则排除',
-      'label.fix': '修改建议',
-      'label.impact': '会造成什么',
-      'label.trigger': '如何被触发',
-      'label.evidence': 'diff 中的证据',
       'label.withheld': '因无法证实而扣留',
       'label.reviewer': '审核模型',
-      'empty.findings': '没有可证实的发现——就这段 diff 而言没有站得住的缺陷。',
+      'label.thinking': '思考等级',
+      'empty.findings': '没有可证实的发现——这里没有值得报告的问题。',
       'stat.files': '个文件',
       'stat.lines': '行',
       'stat.reviewed': '已审核',
@@ -81,10 +100,6 @@ window.__ModuleLoader__.load({
       'stat.findings': '个问题',
       'stat.withheld': '条被扣留',
       'stat.reads': '次上下文读取',
-      'severity.blocker': '阻断',
-      'severity.major': '严重',
-      'severity.minor': '次要',
-      'severity.nit': '细节',
       'toggle.hide': '收起',
       'toggle.show': '展开',
       'raw.fallback': '结构化数据不可用——改为显示报告原文。',
@@ -126,9 +141,8 @@ window.__ModuleLoader__.load({
 .dcr-where { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
 .dcr-cat { font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .dcr-problem { margin-top: 3px; white-space: pre-wrap; }
-.dcr-fix { margin-top: 3px; white-space: pre-wrap; color: var(--dsw-alias-label-secondary); }
-.dcr-impact { margin-top: 4px; white-space: pre-wrap; }
-.dcr-trigger { margin-top: 3px; white-space: pre-wrap; color: var(--dsw-alias-label-secondary); }
+.dcr-field { margin-top: 4px; white-space: pre-wrap; color: var(--dsw-alias-label-secondary); }
+.dcr-field-bare { margin-top: 3px; white-space: pre-wrap; }
 .dcr-evidence-label { margin-top: 5px; }
 .dcr-evidence { max-height: 160px; }
 .dcr-list { margin: 4px 0 0; padding-left: 18px; color: var(--dsw-alias-label-secondary); }
@@ -197,16 +211,55 @@ window.__ModuleLoader__.load({
       return `${file}${Number.isInteger(finding?.line) ? `:${finding.line}` : ''}`
     }
 
-    /** One finding as the report itself words it, so a copy pastes cleanly elsewhere. */
-    function findingText(finding, index) {
+    /**
+     * The mode a payload describes: the fields, their labels and the severity
+     * vocabulary the Host half sent with the report. The card knows nothing about
+     * any particular mode, so a mode a user wrote renders like a built-in one.
+     */
+    function modeOf(payload) {
+      const mode = payload?.mode
+      if (mode === null || typeof mode !== 'object' || !Array.isArray(mode.fields)) return DEFAULT_MODE
+      return {
+        id: typeof mode.id === 'string' ? mode.id : DEFAULT_MODE.id,
+        label: typeof mode.label === 'string' && mode.label !== '' ? mode.label : DEFAULT_MODE.label,
+        verdicts: typeof mode.verdicts === 'object' && mode.verdicts !== null ? mode.verdicts : {},
+        severities: Array.isArray(mode.severities)
+          ? mode.severities.filter(entry => entry !== null && typeof entry === 'object')
+          : DEFAULT_MODE.severities,
+        fields: mode.fields.filter(entry => entry !== null && typeof entry === 'object' && typeof entry.key === 'string'),
+      }
+    }
+
+    /** How one severity is named and toned, for the chip and the withheld list. */
+    function severityOf(mode, id) {
+      const found = mode.severities.find(entry => entry.id === id)
+      if (found !== undefined) {
+        return { id, label: typeof found.label === 'string' && found.label !== '' ? found.label : id, tone: found.tone }
+      }
+      return { id, label: typeof id === 'string' ? id : '?', tone: 'muted' }
+    }
+
+    /**
+     * One finding as the report itself words it, so a copy pastes cleanly
+     * elsewhere. The body is the mode's own field list, in its order: a `block`
+     * field is fenced, an empty label renders the text bare.
+     */
+    function findingText(finding, index, mode = DEFAULT_MODE) {
       const where = whereOf(finding)
-      const lines = [`### ${index + 1}. [${finding?.severity ?? '?'}] ${finding?.title ?? ''}${where === '' ? '' : ` — ${where}`}`]
+      const severity = severityOf(mode, finding?.severity)
+      const lines = [`### ${index + 1}. [${severity.label}] ${finding?.title ?? ''}${where === '' ? '' : ` — ${where}`}`]
       if (finding?.category) lines.push(`category: ${finding.category}`)
-      if (finding?.problem) lines.push('', finding.problem)
-      if (finding?.impact) lines.push('', `**Impact:** ${finding.impact}`)
-      if (finding?.trigger) lines.push('', `**How it is reached:** ${finding.trigger}`)
-      if (finding?.suggestion) lines.push('', `**Fix:** ${finding.suggestion}`)
-      if (finding?.evidence) lines.push('', '**Evidence:**', '', '```diff', finding.evidence, '```')
+      for (const field of mode.fields) {
+        const value = finding?.[field.key]
+        if (typeof value !== 'string' || value === '') continue
+        if (field.block) {
+          lines.push('', ...(field.label === '' ? [] : [`**${field.label}:**`, '']), '```diff', value, '```')
+        } else if (field.label === '') {
+          lines.push('', value)
+        } else {
+          lines.push('', `**${field.label}:** ${value}`)
+        }
+      }
       return lines.join('\n')
     }
 
@@ -244,17 +297,11 @@ window.__ModuleLoader__.load({
       return 'muted'
     }
 
-    function severityTone(severity) {
-      if (severity === 'blocker') return 'error'
-      if (severity === 'major') return 'warn'
-      return 'muted'
-    }
-
     function chip(label, tone, key) {
       return h('span', { className: 'dcr-chip', 'data-tone': tone, key }, label)
     }
 
-    function countLine(payload, t) {
+    function countLine(payload, t, mode) {
       const stats = payload.stats ?? {}
       const parts = [
         `${stats.files ?? 0} ${t('stat.files')}`,
@@ -266,10 +313,10 @@ window.__ModuleLoader__.load({
       const ignored = stats.ignore?.count ?? 0
       if (ignored > 0) parts.push(`${ignored} ${t('stat.ignored')}`)
       const findings = Array.isArray(payload.findings) ? payload.findings : []
-      const bySeverity = SEVERITIES
-        .map(severity => [severity, findings.filter(finding => finding.severity === severity).length])
+      const bySeverity = mode.severities
+        .map(severity => [severityOf(mode, severity.id).label, findings.filter(finding => finding.severity === severity.id).length])
         .filter(([, count]) => count > 0)
-        .map(([severity, count]) => `${t(`severity.${severity}`)} ${count}`)
+        .map(([label, count]) => `${label} ${count}`)
       parts.push(`${findings.length} ${t('stat.findings')}${bySeverity.length === 0 ? '' : ` (${bySeverity.join(', ')})`}`)
       const withheld = Array.isArray(payload.withheld) ? payload.withheld.length : 0
       if (withheld > 0) parts.push(`${withheld} ${t('stat.withheld')}`)
@@ -307,11 +354,11 @@ window.__ModuleLoader__.load({
      * decision aid, and the decision — and the instruction that follows from it —
      * belongs to the human, who hands it to the agent in their own words.
      */
-    function findingActions(finding, index, t) {
+    function findingActions(finding, index, t, mode) {
       return h('div', { className: 'dcr-actions', key: 'actions' }, [
         h(CopyButton, {
           key: 'copy',
-          text: findingText(finding, index),
+          text: findingText(finding, index, mode),
           label: 'action.copyFinding',
           t,
         }),
@@ -319,32 +366,42 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    function findingRow(finding, index, t) {
+    /**
+     * One finding, drawn from the field list its mode declared: the chip is the
+     * mode's name for the severity, the body is the mode's fields in the mode's
+     * order, and a field the mode marked `block` is quoted code.
+     */
+    function findingRow(finding, index, t, mode) {
       const where = whereOf(finding)
+      const severity = severityOf(mode, finding.severity)
+      const body = []
+      for (const field of mode.fields) {
+        const value = finding[field.key]
+        if (typeof value !== 'string' || value === '') continue
+        if (field.block) {
+          body.push(h('div', { key: `field-${field.key}` }, [
+            field.label === ''
+              ? null
+              : h('div', { className: 'dcr-section-label dcr-evidence-label', key: 'label' }, field.label),
+            h('pre', { className: 'dcr-pre dcr-evidence', key: 'quote' }, value),
+          ]))
+          continue
+        }
+        if (field.label === '') {
+          body.push(h('div', { className: 'dcr-field-bare', key: `field-${field.key}` }, value))
+          continue
+        }
+        body.push(h('div', { className: 'dcr-field', key: `field-${field.key}` }, `${field.label}: ${value}`))
+      }
       return h('div', { className: 'dcr-finding', key: `${finding.file ?? ''}#${index}` }, [
         h('div', { className: 'dcr-finding-head', key: 'head' }, [
-          chip(t(`severity.${SEVERITIES.includes(finding.severity) ? finding.severity : 'minor'}`), severityTone(finding.severity), 'sev'),
+          chip(severity.label, severity.tone, 'sev'),
           h('strong', { key: 'title' }, finding.title ?? ''),
           where === '' ? null : h('span', { className: 'dcr-where', key: 'where' }, where),
           finding.category ? h('span', { className: 'dcr-cat', key: 'cat' }, finding.category) : null,
         ]),
-        finding.problem ? h('div', { className: 'dcr-problem', key: 'problem' }, finding.problem) : null,
-        finding.impact
-          ? h('div', { className: 'dcr-impact', key: 'impact' }, `${t('label.impact')}: ${finding.impact}`)
-          : null,
-        finding.trigger
-          ? h('div', { className: 'dcr-trigger', key: 'trigger' }, `${t('label.trigger')}: ${finding.trigger}`)
-          : null,
-        finding.suggestion
-          ? h('div', { className: 'dcr-fix', key: 'fix' }, `${t('label.fix')}: ${finding.suggestion}`)
-          : null,
-        finding.evidence
-          ? h('div', { key: 'evidence' }, [
-            h('div', { className: 'dcr-section-label dcr-evidence-label', key: 'label' }, t('label.evidence')),
-            h('pre', { className: 'dcr-pre dcr-evidence', key: 'quote' }, finding.evidence),
-          ])
-          : null,
-        findingActions(finding, index, t),
+        ...body,
+        findingActions(finding, index, t, mode),
       ])
     }
 
@@ -378,14 +435,14 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    function withheldList(withheld, t) {
+    function withheldList(withheld, t, mode) {
       if (!Array.isArray(withheld) || withheld.length === 0) return null
       return h('div', { className: 'dcr-section' }, [
         h('div', { className: 'dcr-section-label', key: 'label' }, t('label.withheld')),
         h('ul', { className: 'dcr-list', key: 'list' }, withheld.map((item, index) => h(
           'li',
           { key: `${item?.file ?? ''}#${index}` },
-          `[${item?.severity ?? '?'}] ${item?.title ?? '?'} — ${item?.reason ?? '?'}`,
+          `[${severityOf(mode, item?.severity).label}] ${item?.title ?? '?'} — ${item?.reason ?? '?'}`,
         ))),
       ])
     }
@@ -432,14 +489,24 @@ window.__ModuleLoader__.load({
       }
 
       const findings = Array.isArray(payload.findings) ? payload.findings : []
+      const mode = modeOf(payload)
       const reviewer = payload.reviewer
-      const subtitle = `${countLine(payload, t)}${reviewer ? ` · ${t('label.reviewer')} ${reviewer.provider}/${reviewer.model}` : ''}`
+      // The level is shown only when the run asked for one: a review that left
+      // the choice to the provider says nothing rather than claiming a level.
+      const thinking = typeof reviewer?.reasoningEffort === 'string' && reviewer.reasoningEffort !== ''
+        ? ` · ${t('label.thinking')} ${reviewer.reasoningEffort}`
+        : ''
+      const subtitle = `${countLine(payload, t, mode)}${reviewer ? ` · ${t('label.reviewer')} ${reviewer.provider}/${reviewer.model}${thinking}` : ''}`
+      // The verdict chip says the mode's own word for the answer — `fail` for a
+      // code review, `decide before merge` for an architecture review — while the
+      // tone stays the machine verdict, so the card reads the same at a glance.
+      const verdictLabel = payload.mode?.verdict?.label ?? mode.verdicts[payload.verdict] ?? payload.verdict ?? 'pass'
 
       return h('div', { className: 'dcr-card' }, [
         h('style', { key: 'css' }, CSS),
         head(
-          t('title'),
-          [chip(String(payload.verdict ?? 'pass'), toneOf(payload.verdict), 'verdict')],
+          mode.label,
+          [chip(String(verdictLabel), toneOf(payload.verdict), 'verdict')],
           [
             h(CopyButton, { key: 'copy', text: reportOf(outcome.text), label: 'action.copyReport', t }),
             toggle,
@@ -454,11 +521,11 @@ window.__ModuleLoader__.load({
             h('div', { className: 'dcr-section-label', key: 'label' }, t('label.findings')),
             findings.length === 0
               ? h('div', { className: 'dcr-meta', key: 'none' }, t('empty.findings'))
-              : h('div', { key: 'list' }, findings.map((finding, index) => findingRow(finding, index, t))),
+              : h('div', { key: 'list' }, findings.map((finding, index) => findingRow(finding, index, t, mode))),
           ]),
           skippedList(payload.stats?.skipped, t),
           ignoredList(payload.stats?.ignore, t),
-          withheldList(payload.withheld, t),
+          withheldList(payload.withheld, t, mode),
         ]) : null,
       ])
     }
@@ -466,7 +533,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       /** Loaded by the self-test, which imports this artifact with a stub React. */
-      __test: { parsePayload, readOutcome, reportOf, findingText },
+      __test: { parsePayload, readOutcome, reportOf, findingText, modeOf, severityOf },
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, 'en', en), 'code-review: en dictionary')
         ctx.effect(() => ctx.locale.register(NS, 'zh', zh), 'code-review: zh dictionary')

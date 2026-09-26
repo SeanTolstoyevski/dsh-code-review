@@ -2,13 +2,24 @@
  * dsh-code-review — Host half.
  *
  * Audits the uncommitted changes in one workspace — the session's own files when
- * the scope is `session` — with a code-review specialist model, and hands the
- * report to the human who asked for it. Trigger is the human `/review` command;
- * the report comes back as the command result (a card in the Client) and is
- * theirs alone — the Agent is told about it only when `notifyAgent` is set to
- * `steer` or `inject`. Nothing is ever written to the workspace.
+ * the scope is `session` — in one of its **modes**, and hands the report to the
+ * human who asked for it. Trigger is the human `/review` command; the report
+ * comes back as the command result (a card in the Client) and is theirs alone —
+ * the Agent is told about it only when `notifyAgent` is set to `steer` or
+ * `inject`. Nothing is ever written to the workspace.
  *
- * Settings: DSH_HOME/code-review/config.json, re-read on every run.
+ * A mode is a role: its persona prompt, its task, the fields one finding states,
+ * the severity vocabulary that decides the verdict, and a preset of run settings.
+ * Two are built in — `cr` (code review, the default) and `arc` (architecture
+ * review) — and a user adds their own under `modes` in the settings file. The
+ * defaults live in this module; the settings file is kept complete by an
+ * additive sync, and whatever the file states wins. What a mode can never change
+ * is the evidence gate: every finding quotes its proof verbatim and is checked
+ * mechanically against the diff and what the reader tools returned. See
+ * `BUILT_IN_MODES`, `renderContract` and `verifyFindings`.
+ *
+ * Settings: DSH_HOME/code-review/config.json — created with the defaults when it
+ * is missing, missing keys added on load, re-read on every run.
  *
  * Ignored paths are a guarantee, not a preference: `node_modules`, build output,
  * caches and the rest of the standard list are dropped before any diff is built
@@ -16,20 +27,37 @@
  * check or its findings. See `DEFAULT_IGNORE` and `createIgnore`.
  */
 import { randomUUID } from 'node:crypto'
-import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 export const name = 'code-review'
 
 export const inject = ['commands', 'llm', 'workspaceChanges']
 
 /** Payload contract shared with `client.js`. */
-const SCHEMA = 'code-review/1'
+const SCHEMA = 'code-review/2'
 
 const MARKER = '<!-- code-review:payload -->'
 
-const SEVERITIES = ['blocker', 'major', 'minor', 'nit']
+/** The mode `/review` runs when neither the command line nor the file names one. */
+const DEFAULT_MODE_ID = 'cr'
+
+/** Finding keys a mode may not declare as a narrative field: the structure, not the prose. */
+const RESERVED_FIELD_KEYS = new Set(['severity', 'category', 'file', 'line', 'title', 'summary'])
+
+/** Chip tones the Client knows how to draw. */
+const TONES = new Set(['error', 'warn', 'success', 'muted'])
+
+/**
+ * How much each verdict claims. The ranking is what lets a severity table be
+ * read without trusting the order the file happens to list it in: a substitution
+ * or a fallback picks the entry that claims least.
+ */
+const VERDICT_WEIGHT = { pass: 0, warn: 1, fail: 2 }
+
+/** Verdicts a severity may force on a run. */
+const VERDICTS = new Set(Object.keys(VERDICT_WEIGHT))
 
 /** A unified-diff hunk header, capturing its old-side and new-side line counts. */
 const HUNK_HEADER = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/
@@ -46,7 +74,15 @@ const NOTICE_SUMMARY_MAX_CHARS = 120
 
 const NOTIFY_MODES = new Set(['steer', 'inject', 'off'])
 
-const DEFAULTS = {
+/**
+ * The run settings. Every key is a default a mode may override; the settings
+ * file holds one of each, and `modes` (appended by the sync, documented in the
+ * README) holds the modes themselves. Exported for the self-test, which asserts
+ * the created file against it; not part of the plugin contract.
+ */
+export const DEFAULTS = {
+  /** The mode `/review` runs unless `mode=` names another one. */
+  mode: 'cr',
   provider: '',
   model: '',
   language: '',
@@ -70,6 +106,7 @@ const DEFAULTS = {
   maxHintChars: 600,
   maxTokens: 50_000,
   temperature: 0.1,
+  reasoningEffort: '',
   /** Covers the whole reader loop, not one model call. */
   timeoutMs: 600_000,
   /** Extra ignore patterns, on top of the built-in standard list. */
@@ -137,36 +174,68 @@ const ELIDE_AFTER_BYTES = 200_000
 
 const KEEP_RECENT_RESULTS = 2
 
-const SYSTEM_PROMPT = `You are a senior code reviewer auditing one change set that an AI coding agent produced in a live workspace. You receive the unified diffs of the changed files plus their change statistics, and you may read the workspace yourself with the read-only tools provided.
+/**
+ * The narrative fields a mode that declares none works with: what is wrong, and
+ * the proof. Every mode states at least these, and the evidence is never
+ * optional — the gate is what makes a finding worth reading.
+ */
+const DEFAULT_FIELDS = [
+  {
+    key: 'problem',
+    label: 'Problem',
+    required: true,
+    block: false,
+    guide: 'what is wrong and why it matters, in your own words',
+  },
+  { key: 'evidence', label: 'Evidence', required: true, block: true, guide: '' },
+]
+
+/** The severity vocabulary a mode that declares none works with — the code review one. */
+const DEFAULT_SEVERITIES = [
+  {
+    id: 'blocker',
+    label: 'blocker',
+    tone: 'error',
+    verdict: 'fail',
+    meaning: 'the diff proves data corruption or loss, a security hole, or broken correctness on a path the diff shows is real.',
+  },
+  {
+    id: 'major',
+    label: 'major',
+    tone: 'warn',
+    verdict: 'fail',
+    meaning: 'the diff proves wrong behaviour on a real path, or a crash, leak or unbounded growth under a reachable condition.',
+  },
+  {
+    id: 'minor',
+    label: 'minor',
+    tone: 'muted',
+    verdict: 'warn',
+    meaning: 'the diff proves a real defect with low impact.',
+  },
+  {
+    id: 'nit',
+    label: 'nit',
+    tone: 'muted',
+    verdict: 'warn',
+    meaning: 'the diff proves a cosmetic-level defect inside the changed lines, for example a comment that now describes the old behaviour. A style preference is not a nit; it is not a finding at all.',
+  },
+]
+
+const DEFAULT_VERDICTS = { pass: 'PASS', warn: 'WARN', fail: 'FAIL' }
+
+/**
+ * The part of a mode the user owns: who the reviewer is, and what it will not
+ * report. Everything mechanical — the tools, the evidence bar, the required
+ * fields, the severity table, the JSON shape — is appended by `renderContract`
+ * and cannot be switched off, so a hand-written persona still produces findings
+ * the gate can check.
+ */
+const CR_PERSONA = `You are a senior code reviewer auditing one change set that an AI coding agent produced in a live workspace. You receive the unified diffs of the changed files plus their change statistics, and you may read the workspace yourself with the read-only tools provided.
 
 You are accountable for every finding you publish. A finding that turns out to be false, trivial, or unprovable is a defect in your review, and it costs the author real time and trust. A review that reports nothing is a perfectly good review. A review that pads its list with speculation is worse than no review at all. Judge the code, never what you assume the author intended, and never what you have not checked.
 
-## Reading the project
-
-You have three read-only tools: read_file, list_dir and search. They are the only way you touch the workspace, and they cannot change anything or run anything — there is no command execution, no write, and no network. Paths the review excluded as ignored — dependency trees, build output, caches — are outside the project as far as you are concerned: they are not in the diff, the tools refuse them, and nothing found in them is a finding.
-
-Use them to settle a specific question, not to explore:
-- Before reporting a defect that depends on code outside the diff — a caller's arguments, a function's contract, a type's definition, whether a guard already exists upstream — read that code and confirm it. A suspicion you did not check is not a finding.
-- Also read when the diff alone is genuinely ambiguous about what the change does.
-- Do not tour the repository, do not read files unrelated to the change, and do not read a file twice to look for more. A typical review needs zero to four reads; the budget is small and it is shown to you as it shrinks.
-- Reading is for verification, never for finding extra work to report. Anything you notice outside the change set is out of scope unless this diff makes it reachable or worse.
-
-## Evidence bar — this is the whole job
-
-- Every finding MUST quote, in "evidence", the exact line or lines that prove it, copied verbatim: a diff line including its leading "+", "-" or space, or a line from a file you actually read.
-- Every quoted line is checked mechanically against the diff and against everything the tools returned to you. A quote that does not occur there is discarded together with its finding.
-- If you cannot quote such lines, you do not have a finding. Drop it completely: do not report it, do not hint at it, do not mention it in your summary, do not downgrade it into a "consider" note.
-- Reachability counts. A problem that requires an input, state or call path that the code shows to be impossible is not a defect.
-- Pre-existing code is not yours to review. Report a pre-existing problem only when this diff makes it reachable or worse, and say which changed line does that.
-
-## Say what it causes and how it is reached
-
-Every finding must answer two questions in its own words:
-
-- "impact" — what actually goes wrong when this happens: the concrete damage, wrong behaviour or cost, in two or three sentences that a reader who has not seen the code can follow. Not "this is a bug", not a restatement of the severity.
-- "trigger" — the concrete scenario that reaches it: the inputs, the state and the call path, in two or three sentences. Name the real functions, files or endpoints involved, using what the diff and your reads showed you. "If the condition occurs" is not a scenario; "replaying a PGN that ends mid-move reaches this through ApplyMove, which then resets a board the caller still holds" is.
-
-Asking yourself how it is triggered is the point: a defect you cannot describe a route to is a defect you have not shown to be reachable. A finding that cannot answer both questions is withheld and never published.
+You look for defects in the changed lines: the change does not do what it claims, breaks a caller, loses data, races, leaks, swallows a failure, or is unusable through the interface it publishes.
 
 ## Never report — the marks of a junior reviewer
 
@@ -175,28 +244,549 @@ Asking yourself how it is triggered is the point: a defect you cannot describe a
 - Restating what the diff does, or praising it.
 - Anything you would have to phrase as "might", "could potentially", "ensure that", "it would be better if", "be careful that" — with no proven defect behind it.
 - Duplicates: the same defect reported once per hunk or per call site.
-- Guessed or invented details. Never invent a file name, line number, API, flag or behaviour that the diff does not show.
+- Guessed or invented details. Never invent a file name, line number, API, flag or behaviour that the diff does not show.`
 
-## Severity — never inflate, you will be held to it
+/**
+ * The architecture mode: the same evidence bar, a different question. It judges
+ * the shape of the change — placement, responsibility, boundaries, coupling —
+ * rather than its defects, and it is allowed to read the project around the
+ * change to do so. What it does not change is the gate: a design opinion without
+ * a quote and without a stated cost is withheld like any other unproven claim.
+ */
+const ARC_PERSONA = `You are a staff-level software architect auditing one change set that an AI coding agent produced in a live workspace. You receive the unified diffs of the changed files plus their change statistics, and you may read the workspace yourself with the read-only tools provided, so that a judgement about a module, a layer or a boundary rests on the project as it really is rather than on the diff alone.
 
-- blocker: the diff proves data corruption or loss, a security hole, or broken correctness on a path the diff shows is real.
-- major: the diff proves wrong behaviour on a real path, or a crash/leak/unbounded growth under a reachable condition.
-- minor: the diff proves a real defect with low impact.
-- nit: the diff proves a cosmetic-level defect inside the changed lines (for example a comment that now describes the old behaviour).
-A style preference is not a nit. It is not a finding at all. If you hesitate between two severities, choose the lower one.
+You are accountable for every finding you publish. An architecture review is a conversation about a decision, not a list of preferences: a finding that turns out to be taste, or that you cannot tie to a concrete cost, costs the author real time and trust. A review that reports nothing is a perfectly good review — a change that puts the right code in the right place deserves that answer. Your summary is your verdict on the shape of this change.
 
-## Categories
+## What this mode is for
 
-correctness, concurrency / parallelism, error-handling, security, api-misuse, performance, tests, consistency.
+You judge the shape of the change, not its defects. Wrong results, crashes, races, leaks and security holes belong to a separate defect review; do not spend your findings on them, unless the defect is itself the architectural problem — then report the architectural problem. Your questions are:
+
+- Placement: does this code belong in this module, package or layer? Does the change reach across a boundary the rest of the project keeps?
+- Responsibility: does the new function, type or module have one job, and is it the job its name and its published contract claim?
+- Abstraction: is a concept missing, invented twice, or leaking — does a caller now need to know something the abstraction was supposed to hide?
+- Coupling and direction: which way do the new dependencies point, does that match the project's existing direction, and what did this change make harder to move, replace or remove later?
+- Interface shape: are the parameters, the return value and the failure contract of the new API the ones its callers need?
+- Domain language: does the code name the concepts the way the rest of the project, and the domain, name them?
+- Growth: what does this change cost the next person who has to extend it, configure it or test it?
+
+## Never report
+
+- Anything a defect review covers: a wrong result, a crash, a race, a leak, an unhandled failure, a missing guard.
+- Style, formatting, import order, comment or documentation wishes.
+- "I would have designed it differently", "consider extracting/renaming/simplifying", or any preference whose cost you cannot name concretely.
+- Requirements you assume. If the right placement depends on a requirement this change set does not show, say that the decision is undecided rather than inventing the requirement.
+- Restating what the diff does, or praising it.
+- Duplicates: the same structural point once per file or per call site.
+- Guessed or invented details. Never invent a module, a layer, an API or a behaviour the workspace does not show.`
+
+const ARC_TASK = `Judge the architecture of this change set. Read the structural context the judgement needs — the neighbours of the changed files, the module or layer that owns the concept, the callers of the new API, the project's own conventions — and let what you find decide, not what you assume.
+
+Every finding stays anchored to this change: the diff, or a file you read, must show the shape you are objecting to, and your alternative must be a change to this change set rather than a redesign of the project.
+
+State the alternative you would accept — a placement, a boundary, a signature, a name — not only the objection. When the current shape is the better trade-off under a constraint the code shows, do not find against it.`
+
+/**
+ * The modes this release ships. Their prompts are kept here and synced into the
+ * settings file; from then on the file is what decides, and deleting a key is how
+ * a default comes back. Exported for the self-test, not part of the plugin
+ * contract.
+ */
+export const BUILT_IN_MODES = {
+  cr: {
+    label: 'Code review',
+    aliases: ['code', 'codereview'],
+    enabled: true,
+    description: 'Audits the changed lines for defects: the change does not do what it claims, breaks a caller, loses data, races, leaks or swallows a failure.',
+    systemPrompt: CR_PERSONA,
+    task: '',
+    categories: [
+      'correctness', 'concurrency', 'error-handling', 'security',
+      'api-misuse', 'performance', 'tests', 'consistency',
+    ],
+    fields: [
+      {
+        key: 'problem',
+        label: '',
+        required: true,
+        block: false,
+        guide: 'what is proven wrong and why it matters, in your own words',
+      },
+      {
+        key: 'impact',
+        label: 'Impact',
+        required: true,
+        block: false,
+        guide: 'what actually goes wrong when this happens: the concrete damage, wrong behaviour or cost, in two or three sentences a reader who has not seen the code can follow. Not "this is a bug", not a restatement of the severity.',
+      },
+      {
+        key: 'trigger',
+        label: 'How it is reached',
+        required: true,
+        block: false,
+        guide: 'the concrete scenario that reaches it: the inputs, the state and the call path, in two or three sentences. Name the real functions, files or endpoints involved, using what the diff and your reads showed you. "If the condition occurs" is not a scenario; "replaying a PGN that ends mid-move reaches this through ApplyMove, which then resets a board the caller still holds" is.',
+      },
+      {
+        key: 'suggestion',
+        label: 'Fix',
+        required: false,
+        block: false,
+        guide: 'the concrete change to make',
+      },
+      { key: 'evidence', label: 'Evidence', required: true, block: true, guide: '' },
+    ],
+    severities: DEFAULT_SEVERITIES,
+    verdicts: { ...DEFAULT_VERDICTS },
+    settings: {},
+  },
+  arc: {
+    label: 'Architecture review',
+    aliases: ['architect', 'architecture'],
+    enabled: true,
+    description: 'Reviews the shape of the change — placement, responsibility, boundaries, coupling, naming, growth — with the project around it read for context.',
+    systemPrompt: ARC_PERSONA,
+    task: ARC_TASK,
+    categories: [
+      'module-boundary', 'responsibility', 'layering', 'coupling', 'abstraction',
+      'api-shape', 'data-flow', 'naming', 'duplication', 'testability',
+      'extensibility', 'consistency',
+    ],
+    fields: [
+      {
+        key: 'problem',
+        label: '',
+        required: true,
+        block: false,
+        guide: 'the architectural problem: the placement, responsibility, boundary or contract that is wrong, in your own words',
+      },
+      {
+        key: 'consequence',
+        label: 'Consequence',
+        required: true,
+        block: false,
+        guide: 'what this shape costs: the coupling it adds, the change it makes harder, the concept it blurs or the test seam it removes, in two or three sentences a reader who has not seen the code can follow',
+      },
+      {
+        key: 'alternative',
+        label: 'Alternative',
+        required: true,
+        block: false,
+        guide: 'the concrete restructuring you propose — where the code should live, whose job it should be, what the boundary, signature or name should be',
+      },
+      { key: 'evidence', label: 'Evidence', required: true, block: true, guide: '' },
+    ],
+    severities: [
+      {
+        id: 'high',
+        label: 'high',
+        tone: 'error',
+        verdict: 'fail',
+        meaning: 'the change puts a boundary, a responsibility or a contract in a place the project cannot live with, and undoing it later will be expensive.',
+      },
+      {
+        id: 'medium',
+        label: 'medium',
+        tone: 'warn',
+        verdict: 'warn',
+        meaning: 'the shape is workable but it adds real coupling, hides a concept or makes the next change in this area harder.',
+      },
+      {
+        id: 'low',
+        label: 'low',
+        tone: 'muted',
+        verdict: 'warn',
+        meaning: 'a real but local structural point: a name that does not match the domain, a boundary that is blurred without immediate cost.',
+      },
+    ],
+    verdicts: { pass: 'sound', warn: 'worth discussing', fail: 'decide before merge' },
+    settings: { maxToolCalls: 60 },
+  },
+}
+
+/** The keys of one mode entry, in the order the settings file lists them. */
+const MODE_KEYS = [
+  'label', 'aliases', 'enabled', 'description', 'systemPrompt', 'task',
+  'categories', 'fields', 'severities', 'verdicts', 'settings',
+]
+
+/** One mode entry as the settings file spells it: the documented keys, in the documented order. */
+function modeEntry(mode) {
+  return Object.fromEntries(MODE_KEYS.filter(key => Object.hasOwn(mode, key)).map(key => [key, clone(mode[key])]))
+}
+
+/** Keys of a mode entry that carry a prompt, so `promptSource` can say who wrote it. */
+const PROMPT_KEYS = ['systemPrompt', 'task', 'fields', 'severities', 'verdicts', 'categories']
+
+/** A JSON object, not an array and not null. */
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** A deep copy, so a built-in definition handed to the settings file is never shared. */
+function clone(value) {
+  return structuredClone(value)
+}
+
+/** A mode string setting: trimmed, and empty when it is not a string at all. */
+function modeText(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/** A list of names: an array of strings, or one string used as a single entry. */
+function nameList(value) {
+  if (typeof value === 'string') return value.trim() === '' ? [] : [value.trim()]
+  if (!Array.isArray(value)) return []
+  return value.filter(entry => typeof entry === 'string' && entry.trim() !== '').map(entry => entry.trim())
+}
+
+/**
+ * The narrative fields of one mode, in the order the report and the card show
+ * them. A field the mode did not declare keeps its shape: an empty label renders
+ * the text bare, `required` defaults to true for a declared field (an
+ * unanswered field is withheld, never silent), and `evidence` is appended and
+ * forced to required when the mode left it out — the gate is not optional.
+ */
+function normalizeFields(value, modeId, log) {
+  if (value !== undefined && !Array.isArray(value)) {
+    log.warn(`mode "${modeId}": "fields" is not an array; using the default fields`)
+  }
+  const declared = Array.isArray(value) ? value : []
+  const fields = []
+  const seen = new Set()
+  for (const entry of declared) {
+    if (!isPlainObject(entry)) {
+      log.warn(`mode "${modeId}": a field entry is not a JSON object; dropped`)
+      continue
+    }
+    const key = modeText(entry.key)
+    if (key === '') {
+      log.warn(`mode "${modeId}": a field entry has no "key"; dropped`)
+      continue
+    }
+    if (RESERVED_FIELD_KEYS.has(key)) {
+      log.warn(`mode "${modeId}": "${key}" is part of the finding structure and cannot be a field key; dropped`)
+      continue
+    }
+    if (seen.has(key)) {
+      log.warn(`mode "${modeId}": field "${key}" is declared twice; the first one stands`)
+      continue
+    }
+    seen.add(key)
+    fields.push({
+      key,
+      label: Object.hasOwn(entry, 'label') ? modeText(entry.label) : key,
+      required: booleanSetting(entry.required, true) === true,
+      block: booleanSetting(entry.block, false) === true,
+      guide: modeText(entry.guide),
+    })
+  }
+  if (declared.length === 0) return clone(DEFAULT_FIELDS)
+  if (fields.length === 0) {
+    log.warn(`mode "${modeId}": no usable field survived; using the default fields`)
+    return clone(DEFAULT_FIELDS)
+  }
+  const evidence = fields.find(field => field.key === 'evidence')
+  if (evidence === undefined) {
+    fields.push(clone(DEFAULT_FIELDS[1]))
+  } else if (!evidence.required || evidence.block !== true) {
+    log.warn(`mode "${modeId}": "evidence" is required and shown as a block in every mode; the mode's own setting is ignored`)
+    evidence.required = true
+    evidence.block = true
+  }
+  return fields
+}
+
+/**
+ * The severity vocabulary of one mode: the ids the model may use, how each is
+ * drawn in the card, which verdict it forces, and what it means (the last is
+ * quoted in the contract, so an arbitrary vocabulary still defines itself).
+ */
+function normalizeSeverities(value, modeId, log) {
+  if (value !== undefined && !Array.isArray(value)) {
+    log.warn(`mode "${modeId}": "severities" is not an array; using the default severities`)
+  }
+  const declared = Array.isArray(value) ? value : []
+  const severities = []
+  const seen = new Set()
+  for (const entry of declared) {
+    if (!isPlainObject(entry)) {
+      log.warn(`mode "${modeId}": a severity entry is not a JSON object; dropped`)
+      continue
+    }
+    const id = modeText(entry.id)
+    if (id === '') {
+      log.warn(`mode "${modeId}": a severity entry has no "id"; dropped`)
+      continue
+    }
+    if (seen.has(id)) {
+      log.warn(`mode "${modeId}": severity "${id}" is declared twice; the first one stands`)
+      continue
+    }
+    seen.add(id)
+    const verdict = modeText(entry.verdict)
+    if (verdict !== '' && !VERDICTS.has(verdict)) {
+      log.warn(`mode "${modeId}": severity "${id}" declares the verdict "${verdict}", which is not one of fail/warn/pass; treated as "warn"`)
+    }
+    const tone = modeText(entry.tone)
+    if (tone !== '' && !TONES.has(tone)) {
+      log.warn(`mode "${modeId}": severity "${id}" declares the tone "${tone}", which is not one of error/warn/success/muted; it is drawn like its verdict`)
+    }
+    severities.push({
+      id,
+      label: Object.hasOwn(entry, 'label') ? modeText(entry.label) : id,
+      verdict: VERDICTS.has(verdict) ? verdict : 'warn',
+      tone: TONES.has(tone) ? tone : undefined,
+      meaning: modeText(entry.meaning),
+    })
+  }
+  if (severities.length === 0) {
+    if (declared.length > 0) log.warn(`mode "${modeId}": no usable severity survived; using the default severities`)
+    return clone(DEFAULT_SEVERITIES)
+  }
+  for (const severity of severities) {
+    if (severity.tone === undefined) severity.tone = severity.verdict === 'fail' ? 'error' : severity.verdict === 'warn' ? 'warn' : 'muted'
+  }
+  return severities
+}
+
+/** The display label of each verdict, which is the mode's own wording for its answer. */
+function normalizeVerdicts(value, modeId, log) {
+  if (value !== undefined && !isPlainObject(value)) {
+    log.warn(`mode "${modeId}": "verdicts" is not a JSON object; using the default labels`)
+  }
+  const declared = isPlainObject(value) ? value : {}
+  const verdicts = {}
+  for (const [key, fallback] of Object.entries(DEFAULT_VERDICTS)) {
+    verdicts[key] = modeText(declared[key]) === '' ? fallback : modeText(declared[key])
+  }
+  return verdicts
+}
+
+/** The run settings a mode presets; they win over the file's own and lose to the command line. */
+function normalizeModeSettings(value, modeId, log) {
+  if (value === undefined) return {}
+  if (!isPlainObject(value)) {
+    log.warn(`mode "${modeId}": "settings" is not a JSON object; ignored`)
+    return {}
+  }
+  const settings = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === 'mode' || key === 'modes') {
+      log.warn(`mode "${modeId}": "settings.${key}" cannot be set by a mode; ignored`)
+      continue
+    }
+    if (!Object.hasOwn(DEFAULTS, key)) {
+      log.warn(`mode "${modeId}": "settings.${key}" is not a setting this plugin reads; ignored`)
+      continue
+    }
+    settings[key] = entry
+  }
+  return settings
+}
+
+/** Two JSON values, as a mode file spells them, are the same. */
+function sameJson(left, right) {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
+}
+
+/**
+ * Whether a mode entry still carries the prompt this release ships. The result
+ * is what the report calls the prompt's source, so a user can tell "my edit is
+ * in force" from "this is the release default" without diffing the file.
+ */
+function promptUnchanged(entry, fallback) {
+  return PROMPT_KEYS.every(key => sameJson(entry[key], fallback[key]))
+}
+
+/**
+ * One mode entry, with every key a usable value: what the user wrote where the
+ * user wrote it, the release default everywhere else. A mode that is not a JSON
+ * object at all is reported and replaced by its default, so a hand-edited file
+ * can never leave a mode half-defined.
+ */
+function normalizeMode(id, raw, fallback, log) {
+  const entry = isPlainObject(raw) ? raw : {}
+  if (raw !== undefined && !isPlainObject(raw)) log.warn(`mode "${id}" is not a JSON object; using its default`)
+  const base = isPlainObject(fallback) ? fallback : {}
+  return {
+    id,
+    label: modeText(entry.label) === '' ? (modeText(base.label) === '' ? id : modeText(base.label)) : modeText(entry.label),
+    description: modeText(entry.description) === '' ? modeText(base.description) : modeText(entry.description),
+    aliases: nameList(entry.aliases ?? base.aliases),
+    enabled: booleanSetting(entry.enabled, base.enabled !== false) === true,
+    systemPrompt: Object.hasOwn(entry, 'systemPrompt') ? modeText(entry.systemPrompt) : modeText(base.systemPrompt),
+    task: Object.hasOwn(entry, 'task') ? modeText(entry.task) : modeText(base.task),
+    categories: nameList(entry.categories ?? base.categories),
+    fields: normalizeFields(Object.hasOwn(entry, 'fields') ? entry.fields : base.fields, id, log),
+    severities: normalizeSeverities(Object.hasOwn(entry, 'severities') ? entry.severities : base.severities, id, log),
+    verdicts: normalizeVerdicts(Object.hasOwn(entry, 'verdicts') ? entry.verdicts : base.verdicts, id, log),
+    settings: normalizeModeSettings(Object.hasOwn(entry, 'settings') ? entry.settings : base.settings, id, log),
+    /** Whether this mode ships with the plugin, which is what the sync keeps complete. */
+    builtIn: fallback !== undefined,
+    /** `file` when someone edited the prompt, `default` when it is still this release's. */
+    promptFrom: fallback === undefined || (isPlainObject(raw) && !promptUnchanged(raw, fallback)) ? 'file' : 'default',
+  }
+}
+
+/**
+ * Every mode the file declares, in resolution order: the built-in ids first,
+ * then the user's own. An id always beats an alias, and an alias that names
+ * another mode is not an alias at all — so a user mode can never quietly take
+ * over a name the file already gave to something else.
+ */
+function resolveModes(settings, log) {
+  const declared = isPlainObject(settings.modes) ? settings.modes : {}
+  const modes = []
+  for (const [id, fallback] of Object.entries(BUILT_IN_MODES)) {
+    modes.push(normalizeMode(id, Object.hasOwn(declared, id) ? declared[id] : fallback, fallback, log))
+  }
+  for (const [id, raw] of Object.entries(declared)) {
+    if (Object.hasOwn(BUILT_IN_MODES, id)) continue
+    if (!isPlainObject(raw)) {
+      log.warn(`mode "${id}" is not a JSON object; the mode is not offered`)
+      continue
+    }
+    modes.push(normalizeMode(id, raw, undefined, log))
+  }
+  const byId = new Map()
+  const byAlias = new Map()
+  for (const mode of modes) {
+    const key = mode.id.toLowerCase()
+    if (!byId.has(key)) byId.set(key, mode)
+  }
+  for (const mode of modes) {
+    for (const alias of mode.aliases) {
+      const key = alias.toLowerCase()
+      if (key === '' || byId.has(key) || byAlias.has(key)) continue
+      byAlias.set(key, mode)
+    }
+  }
+  for (const [key, mode] of byId) byAlias.set(key, mode)
+  return { modes, lookup: name => byAlias.get(name) ?? undefined }
+}
+
+/** The modes a run can pick, as the error message and the log name them. */
+function availableModes(modes) {
+  const enabled = modes.filter(mode => mode.enabled)
+  const list = enabled.map(mode => `${mode.id} (${mode.label})`).join(', ')
+  return list === '' ? 'none are enabled' : `available: ${list}`
+}
+
+/**
+ * Which mode this run uses: what was typed, else the file's `mode`, else `cr`.
+ *
+ * A name typed on the command line that does not resolve — or that resolves to a
+ * mode switched off — is an error, because a run that silently answered as
+ * another mode would be a lie about what is in the report. A broken default in
+ * the file is a warning and falls back to the first mode that is on: a typo in a
+ * setting must not make `/review` unusable.
+ */
+function resolveMode(settings, overrides, log) {
+  const { modes, lookup } = resolveModes(settings, log)
+  const typed = modeText(overrides.mode)
+  const configured = modeText(settings.mode)
+  const requested = typed === '' ? configured : typed
+  const name = requested === '' ? DEFAULT_MODE_ID : requested
+  const mode = lookup(name.toLowerCase())
+  if (mode !== undefined && mode.enabled === true) return { mode }
+  if (typed !== '') {
+    return {
+      failure: mode === undefined
+        ? `unknown mode "${typed}" — ${availableModes(modes)}. Add your own under "modes" in ${configPath()}, or run /review without mode= for the default.`
+        : `mode "${typed}" is disabled — ${availableModes(modes)}`,
+    }
+  }
+  if (mode !== undefined) log.warn(`the configured mode "${configured}" is disabled`)
+  else if (configured !== '') log.warn(`the configured mode "${configured}" does not exist — ${availableModes(modes)}`)
+  const fallback = modes.find(entry => entry.enabled === true)
+  if (fallback === undefined) {
+    return { failure: `no mode is enabled — every mode in ${configPath()} has "enabled": false` }
+  }
+  if (fallback.id.toLowerCase() !== name.toLowerCase()) log.warn(`using the mode "${fallback.id}" instead`)
+  return { mode: fallback }
+}
+
+/**
+ * What every mode is told, whatever its persona says: the tools, the evidence
+ * bar, the fields a finding must state, the severity table, the categories and
+ * the exact JSON shape. Appended to the mode's own prompt and not writable by
+ * it, because these are the rules the run is verified against.
+ */
+function renderContract(mode) {
+  const fields = mode.fields
+    .map(field => `- "${field.key}" (${field.label === '' ? field.key : field.label})${field.required ? ' — required' : ' — optional'}${field.guide === '' ? '' : `: ${field.guide}`}`)
+    .join('\n')
+  const severities = mode.severities
+    .map(severity => `- ${severity.id} (${severity.label}) — ${severity.verdict === 'pass' ? 'does not move the verdict' : `forces the verdict to "${severity.verdict}" at least`}${severity.meaning === '' ? '' : `: ${severity.meaning}`}`)
+    .join('\n')
+  const categories = mode.categories.length === 0
+    ? ''
+    : `\n## Categories\n\n${mode.categories.join(', ')}\n`
+  return `## Reading the project
+
+You have three read-only tools: read_file, list_dir and search. They are the only way you touch the workspace, and they cannot change anything or run anything — there is no command execution, no write, and no network. Paths the review excluded as ignored — dependency trees, build output, caches — are outside the project as far as you are concerned: they are not in the diff, the tools refuse them, and nothing found in them is a finding.
+
+Use them to settle a specific question, not to explore:
+- Before reporting a finding that depends on code outside the diff — a caller's arguments, a function's contract, a type's definition, whether a guard already exists upstream — read that code and confirm it. A suspicion you did not check is not a finding.
+- Also read when the diff alone is genuinely ambiguous about what the change does.
+- Do not tour the repository, do not read files unrelated to the change, and do not read a file twice to look for more. The budget is small and it is shown to you as it shrinks.
+- Reading is for verification, never for finding extra work to report. Anything you notice outside the change set is out of scope unless this diff makes it reachable or worse.
+
+## Evidence bar — this is the whole job
+
+- Every finding MUST quote, in "evidence", the exact line or lines that prove it, copied verbatim: a diff line including its leading "+", "-" or space, or a line from a file you actually read.
+- Every quoted line is checked mechanically against the diff and against everything the tools returned to you. A quote that does not occur there is discarded together with its finding.
+- If you cannot quote such lines, you do not have a finding. Drop it completely: do not report it, do not hint at it, do not mention it in your summary, do not downgrade it into a "consider" note.
+- Reachability counts. A problem that requires an input, state or call path that the code shows to be impossible is not a finding.
+- Pre-existing code is not yours to review. Report a pre-existing problem only when this diff makes it reachable or worse, and say which changed line does that.
+
+## What a finding must state
+
+${fields}
+
+Every field marked required must be answered in the finding's own words, at the depth its guide asks for. A finding that cannot answer one of them is withheld and never published.
+
+## Severity
+
+${severities}
+
+Never inflate a severity: you will be held to it. If you hesitate between two severities, choose the lower one. A matter of taste is not the lowest severity; it is not a finding at all.
+${categories}
+## Output
+
+Output exactly one JSON object, with no prose and no code fence:
+${jsonTemplate(mode)}
+
+The verdict is recomputed from the severities of the findings that survive, so never state a verdict the findings do not support. "summary" says what the change set does and whether it holds up, and it mentions only what you kept.
 
 ## Self-check before you answer
 
-Re-read your own findings and delete every one that fails any of these: (a) it carries a verbatim quote that occurs in the diff or in something the tools returned; (b) everything it depends on has been read and confirmed, not assumed; (c) the triggering path is reachable per what you read, and you can describe it; (d) it says what it causes and how it is reached, in concrete terms; (e) it is a defect, not a matter of taste; (f) it is worth an expert author's attention. Then re-check that your summary describes only what you kept.
+Re-read your own findings and delete every one that fails any of these: (a) it carries a verbatim quote that occurs in the diff or in something the tools returned; (b) everything it depends on has been read and confirmed, not assumed; (c) the path or the consequence it describes is reachable per what you read, and you can describe it; (d) every required field is answered in concrete terms; (e) it is the kind of problem this mode is here to find, not a matter of taste; (f) it is worth an expert author's attention. Then re-check that your summary describes only what you kept.`
+}
 
-Output exactly one JSON object, with no prose and no code fence:
-{"verdict":"pass"|"warn"|"fail","summary":"<2-4 factual sentences: what the change set does and whether it holds up>","findings":[{"severity":"blocker"|"major"|"minor"|"nit","category":"<one category>","file":"<path exactly as the diff names it>","line":<number the diff shows for the new file, or null>,"title":"<short, specific, imperative>","problem":"<what is proven wrong and why it matters>","impact":"<2-3 sentences: what this causes when it happens>","trigger":"<2-3 sentences: the concrete scenario, inputs and call path that reach it>","suggestion":"<the concrete change to make>","evidence":"<verbatim line(s) proving it — from the diff or from a file you read — each on its own line>"}]}
+/** The JSON object the mode's reviewer must return, built from the mode's own vocabulary. */
+function jsonTemplate(mode) {
+  const severity = mode.severities.map(entry => entry.id).join('"|"')
+  const category = mode.categories.length === 0 ? '<one category>' : mode.categories.join('|')
+  const members = [
+    `"severity":"${severity}"`,
+    `"category":"${category}"`,
+    '"file":"<path exactly as the diff names it>"',
+    '"line":<number the diff shows for the new file, or null>',
+    '"title":"<short, specific, imperative>"',
+    ...mode.fields.map(field => `"${field.key}":"${
+      field.block
+        ? '<verbatim line(s) proving it — from the diff or from a file you read — each on its own line>'
+        : `<${field.key}>`
+    }"`),
+  ]
+  return `{"verdict":"fail"|"warn"|"pass","summary":"<2-4 factual sentences: what the change set does and whether it holds up>","findings":[{${members.join(',')}}]}`
+}
 
-verdict "fail" when a blocker or major finding exists, "warn" when only minor or nit findings exist, "pass" when there are none. An empty findings array with verdict "pass" is a complete, respectable answer.`
+/** The system prompt of one run: the mode's own persona, then the contract it cannot change. */
+function systemPromptFor(mode) {
+  const contract = renderContract(mode)
+  return mode.systemPrompt === '' ? contract : `${mode.systemPrompt}\n\n${contract}`
+}
 
 /** `~`, `~/…` and `~\…` expand against the operating-system home. */
 function expandHomePath(path) {
@@ -228,32 +818,147 @@ function configPath() {
   return join(dshHome(), 'code-review', 'config.json')
 }
 
-function readSettings(log) {
+/** The whole settings file a fresh machine gets: the run settings, then the modes. */
+function defaultDocument() {
+  return {
+    ...clone(DEFAULTS),
+    modes: Object.fromEntries(Object.entries(BUILT_IN_MODES).map(([id, mode]) => [id, modeEntry(mode)])),
+  }
+}
+
+/**
+ * Create `DSH_HOME/code-review/config.json` with the defaults when no file is
+ * there yet, so the file the user is told to edit exists on a fresh machine.
+ *
+ * Exclusive create is the whole contract: an existing file — hand-tuned, left by
+ * an earlier release, or unparsable — is never touched, and a concurrent boot
+ * loses the race with EEXIST instead of truncating the winner's file. Writing is
+ * best-effort by construction: a home that cannot be written warns and leaves
+ * this run on the defaults.
+ *
+ * @returns whether this call created the file.
+ */
+function ensureSettingsFile(log) {
+  const file = configPath()
+  try {
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, `${JSON.stringify(defaultDocument(), null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
+    log.info(`created ${file} with the default settings and the built-in modes — edit it to tune the review; every run re-reads it`)
+    return true
+  } catch (error) {
+    if (error?.code === 'EEXIST') return false
+    log.warn(`cannot create ${file}: ${String(error)}; using the default settings`)
+    return false
+  }
+}
+
+/**
+ * Adds what the file is missing — a release setting, the `modes` block, a mode
+ * this release ships, a key inside one — and never replaces a value the user
+ * wrote. The file's own key order and any key of its own are kept, the additions
+ * are appended, and a value that exists but is the wrong shape is reported and
+ * left exactly as it is rather than repaired behind the user's back.
+ *
+ * The one rule worth remembering: deleting a key is how the release default
+ * comes back, and a built-in mode is removed from the command surface with
+ * `"enabled": false`, not by deleting it.
+ *
+ * @returns the document to work with, and the list of keys this call added.
+ */
+function syncDocument(parsed, log) {
+  const doc = { ...parsed }
+  const added = []
+  for (const [key, value] of Object.entries(DEFAULTS)) {
+    if (Object.hasOwn(doc, key)) continue
+    doc[key] = clone(value)
+    added.push(key)
+  }
+  if (doc.modes === undefined) {
+    doc.modes = Object.fromEntries(Object.entries(BUILT_IN_MODES).map(([id, mode]) => [id, modeEntry(mode)]))
+    added.push('modes')
+  } else if (!isPlainObject(doc.modes)) {
+    log.warn(`${configPath()}: "modes" is not a JSON object; the built-in modes are used and the file is left as it is`)
+  } else {
+    const modes = { ...doc.modes }
+    for (const [id, fallback] of Object.entries(BUILT_IN_MODES)) {
+      const current = modes[id]
+      if (current === undefined) {
+        modes[id] = modeEntry(fallback)
+        added.push(`modes.${id}`)
+        continue
+      }
+      if (!isPlainObject(current)) {
+        log.warn(`${configPath()}: mode "${id}" is not a JSON object; its default is used and the file is left as it is`)
+        continue
+      }
+      const filled = { ...current }
+      for (const key of MODE_KEYS) {
+        if (!Object.hasOwn(fallback, key) || Object.hasOwn(filled, key)) continue
+        filled[key] = clone(fallback[key])
+        added.push(`modes.${id}.${key}`)
+      }
+      modes[id] = filled
+    }
+    doc.modes = modes
+  }
+  return { doc, added }
+}
+
+/** Writes the synced document, best-effort: a read-only home warns and the run goes on. */
+function writeSynced(log, file, doc, added) {
+  try {
+    writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`, { encoding: 'utf8' })
+    log.info(`synced ${added.join(', ')} into ${file}`)
+  } catch (error) {
+    log.warn(`cannot write ${file}: ${String(error)}; this run uses the values in memory`)
+  }
+}
+
+/**
+ * The settings of this run, and the file the user edits.
+ *
+ * The file is created when it is missing and completed when it is incomplete,
+ * and it is re-read on every `/review`, so tuning needs neither a restart nor a
+ * reload. A file that does not parse is reported and left alone; the run uses
+ * the defaults and the next release's prompts are then the ones in force.
+ */
+function loadSettings(log) {
+  const file = configPath()
   let raw
   try {
-    raw = readFileSync(configPath(), 'utf8')
+    raw = readFileSync(file, 'utf8')
   } catch (error) {
     if (error?.code !== 'ENOENT') {
-      log.warn(`cannot read ${configPath()}: ${String(error)}; using defaults`)
+      log.warn(`cannot read ${file}: ${String(error)}; using defaults`)
+      return { ...clone(DEFAULTS) }
     }
-    return { ...DEFAULTS }
+    ensureSettingsFile(log)
+    try {
+      raw = readFileSync(file, 'utf8')
+    } catch (again) {
+      log.warn(`cannot read ${file}: ${String(again)}; using defaults`)
+      return { ...clone(DEFAULTS) }
+    }
   }
+  let parsed
   try {
-    const parsed = JSON.parse(raw)
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      log.warn(`${configPath()} is not a JSON object; using defaults`)
-      return { ...DEFAULTS }
-    }
-    return { ...DEFAULTS, ...parsed }
+    parsed = JSON.parse(raw)
   } catch (error) {
-    log.warn(`${configPath()} is not valid JSON (${String(error)}); using defaults`)
-    return { ...DEFAULTS }
+    log.warn(`${file} is not valid JSON (${String(error)}); using defaults`)
+    return { ...clone(DEFAULTS) }
   }
+  if (!isPlainObject(parsed)) {
+    log.warn(`${file} is not a JSON object; using defaults`)
+    return { ...clone(DEFAULTS) }
+  }
+  const { doc, added } = syncDocument(parsed, log)
+  if (added.length > 0) writeSynced(log, file, doc, added)
+  return { ...clone(DEFAULTS), ...doc }
 }
 
 /** Keys accepted as leading `key=value` arguments of the command. */
 const ARG_KEYS = new Set([
-  'provider', 'model', 'language', 'gitRev', 'source',
+  'mode', 'provider', 'model', 'reasoningEffort', 'language', 'gitRev', 'source',
   'ignored', 'ignore', 'ignoreDefaults', 'respectGitIgnore',
 ])
 
@@ -303,6 +1008,50 @@ function firstNonEmpty(...values) {
     if (typeof value === 'string' && value !== '') return value
   }
   return undefined
+}
+
+/**
+ * The thinking level this run asks the reviewer to reason at: what was typed
+ * after `/review`, else the mode's preset, else the file's own value, else none
+ * at all. An empty layer states no preference — it never shadows a value the
+ * layer below it carries — and `undefined` means the request leaves the field
+ * out entirely, so the provider's default effort is the one that runs.
+ *
+ * The three layers are read apart rather than off the merged settings object on
+ * purpose: `{ ...fileSettings, ...mode.settings }` would let an empty mode
+ * preset erase a level the user wrote in the file.
+ */
+function resolveReasoningEffort(mode, fileSettings, overrides) {
+  return firstNonEmpty(
+    modeText(overrides.reasoningEffort),
+    modeText(mode.settings.reasoningEffort),
+    modeText(fileSettings.reasoningEffort),
+  )
+}
+
+/**
+ * A thinking level the model does not offer is refused before any call, with
+ * the levels it does offer named — the rule an unknown `mode=` already follows.
+ * The check is skipped when the adapter cannot be asked (an unregistered route,
+ * a middleware-served one, a Host that exposes no model metadata): there the
+ * call itself is the judge, exactly as it was before this setting existed.
+ */
+async function checkReasoningEffort(ctx, route, effort, signal) {
+  if (effort === undefined || typeof ctx.llm.resolveModelInfo !== 'function') return undefined
+  let info
+  try {
+    info = await ctx.llm.resolveModelInfo(route.provider, route.model, signal)
+  } catch {
+    return undefined
+  }
+  const efforts = info?.reasoning?.efforts
+  if (!Array.isArray(efforts) || efforts.length === 0) {
+    return `${route.provider}/${route.model} declares no reasoning levels, so reasoningEffort "${effort}" cannot be used.` +
+      ` Delete "reasoningEffort" in ${configPath()} or drop reasoningEffort= from the command.`
+  }
+  if (efforts.some(entry => entry?.id === effort)) return undefined
+  return `reasoningEffort "${effort}" is not offered by ${route.provider}/${route.model} — available: ${efforts.map(entry => entry.id).join(', ')}.` +
+    ` Fix "reasoningEffort" in ${configPath()} or drop reasoningEffort= from the command.`
 }
 
 function clamp(text, max) {
@@ -1298,17 +2047,23 @@ function runReaderTool(call, root, budget, signal, settings, ignore) {
   return { text: `unknown tool "${call.name}"; read_file, list_dir and search are the only tools available`, isError: true }
 }
 
-async function callModel(ctx, route, settings, messages, tools, signal) {
+/**
+ * One model call. `system` is the mode's persona plus the contract it cannot
+ * change, built once per run by `systemPromptFor`.
+ */
+async function callModel(ctx, route, settings, messages, tools, signal, system) {
   const request = {
     provider: route.provider,
     model: route.model,
-    system: SYSTEM_PROMPT,
+    system,
     messages,
     maxTokens: settings.maxTokens,
     temperature: settings.temperature,
     signal,
   }
   if (tools !== undefined) request.tools = tools
+  // Absent when no layer asked for a level: the provider's default then runs.
+  if (route.reasoningEffort !== undefined) request.reasoningEffort = route.reasoningEffort
 
   let text = ''
   const calls = new Map()
@@ -1356,8 +2111,11 @@ function summarizeCall(call) {
  * whole rather than rebuilt here: a second policy assembled from the settings
  * alone would quietly drop the repository layer, and the files this very run
  * reported as excluded would be readable, searchable and citable again.
+ *
+ * `system` is the mode's persona plus its contract, and it is passed on every
+ * call of the loop: the two of them belong to the run, not to one message.
  */
-async function reviewWithReader({ ctx, route, settings, policy, prompt, root, signal, deadlineAt, log }) {
+async function reviewWithReader({ ctx, route, settings, policy, prompt, system, root, signal, deadlineAt, log }) {
   const messages = [{ role: 'user', content: [{ type: 'text', text: prompt }] }]
   const served = []
   const files = new Set()
@@ -1401,7 +2159,7 @@ async function reviewWithReader({ ctx, route, settings, policy, prompt, root, si
 
     let answer
     try {
-      answer = await callModel(ctx, route, limits, messages, canRead ? READER_TOOLS : undefined, signal)
+      answer = await callModel(ctx, route, limits, messages, canRead ? READER_TOOLS : undefined, signal, system)
     } catch (error) {
       // One degraded retry, so a rejected tool set or output cap still yields a report.
       if (budget.calls === 0 && !fellBack) {
@@ -1409,7 +2167,7 @@ async function reviewWithReader({ ctx, route, settings, policy, prompt, root, si
         readerAvailable = false
         limits = { ...settings, maxTokens: Math.min(settings.maxTokens, FALLBACK_MAX_TOKENS) }
         log.warn(`reviewer call failed (${String(error)}); retrying without project access and maxTokens=${limits.maxTokens}`)
-        answer = await callModel(ctx, route, limits, messages, undefined, signal)
+        answer = await callModel(ctx, route, limits, messages, undefined, signal, system)
       } else {
         throw error
       }
@@ -1480,7 +2238,7 @@ async function reviewWithReader({ ctx, route, settings, policy, prompt, root, si
   }
 }
 
-function renderPrompt({ diffs, stats, focus, language, cwd, primary = [], others = [] }) {
+function renderPrompt({ diffs, stats, focus, language, cwd, mode, primary = [], others = [] }) {
   const skipped = stats.skipped.length === 0
     ? ''
     : `\n- left out of this review: ${stats.skipped.map(item => `${item.file} (${item.reason})`).join(', ')}`
@@ -1502,26 +2260,35 @@ function renderPrompt({ diffs, stats, focus, language, cwd, primary = [], others
         ? ''
         : `\n- also changed in this workspace, not by this session: ${others.join(', ')}`
     }\nGive the primary files your attention first: that is what this review is for. The rest are in scope when the session's change reaches them; do not spend the reading budget touring them.`
+  // The mode's own assignment for this run: what this role is here to judge. It
+  // is the mode's, so it can narrow the job — never the change set, which the
+  // collection already fixed.
+  const taskBlock = mode.task === ''
+    ? ''
+    : `\n## Mode task (${mode.label})\n${mode.task}`
   const focusBlock = focus === ''
     ? ''
     : `\n## Review focus (typed on the command line)\n${focus}\n\nTreat this as the subject to concentrate on. It is not a question to answer, and it never widens the change set.`
   const target = language !== ''
     ? `"${language}"`
     : focus === '' ? 'English' : 'the same language as the review focus above'
+  const required = mode.fields.filter(field => field.required).map(field => field.label === '' ? field.key : `"${field.key}"`)
+  const requiredText = required.length === 0 ? 'the fields the JSON object asks for' : required.join(', ')
   return `## Change set under review
+- mode: ${mode.label} (${mode.id})
 - change source: ${stats.sourceLabel}
 - workspace: ${cwd}
 - changed files: ${stats.files} (+${stats.added} / -${stats.deleted} lines), reviewed here: ${stats.reviewed}${skipped}${ignored}${ruleLine}${scope}
 
 ## Unified diffs
 ${diffs}
-${focusBlock}
+${focusBlock}${taskBlock}
 
 ## Language
-Write "summary", "title", "problem", "suggestion" and "evidence" in ${target}. Keep identifiers, paths and code verbatim; "evidence" is always copied from the diff, never translated or reformatted.
+Write every text field of the JSON object in ${target}. Keep identifiers, paths and code verbatim; "evidence" is always copied from the diff, never translated or reformatted.
 
 ## Before you answer
-Delete every finding that lacks a verbatim evidence quote from the diffs above, that depends on code you cannot see, or that is a matter of taste. Your summary must mention only what survives. Reporting nothing is a valid outcome; reporting an unproven claim is not.
+Delete every finding that lacks a verbatim evidence quote from the diffs above, that leaves one of ${requiredText} unanswered, that depends on code you cannot see, or that is a matter of taste. Your summary must mention only what survives. Reporting nothing is a valid outcome; reporting an unproven claim is not.
 
 Review the change set now and reply with the JSON object only.`
 }
@@ -1550,28 +2317,42 @@ function extractJsonObject(text) {
   return undefined
 }
 
-function normalizeFinding(value) {
+/**
+ * One finding as the mode reads it: the structure the gate checks, and one
+ * string per field the mode declared. Keys the mode did not declare are dropped
+ * — the JSON contract it was given names its fields, and nothing else.
+ *
+ * A severity the mode does not declare is lowered to the weakest one the mode
+ * has rather than guessed upward, and the substitution is logged: an inflated
+ * severity would survive the gate and mislead the reader.
+ */
+function normalizeFinding(value, mode, log) {
   if (value === null || typeof value !== 'object') return undefined
-  const problem = typeof value.problem === 'string' ? value.problem.trim() : ''
-  const title = typeof value.title === 'string' ? value.title.trim() : ''
-  if (problem === '' && title === '') return undefined
-  const severity = typeof value.severity === 'string' && SEVERITIES.includes(value.severity) ? value.severity : 'minor'
   const text = key => (typeof value[key] === 'string' ? value[key].trim() : '')
-  return {
-    severity,
+  const declared = text('severity')
+  let severity = mode.severities.find(entry => entry.id === declared)
+  if (severity === undefined) {
+    severity = weakestSeverity(mode)
+    if (declared !== '') log.warn(`the reviewer used the severity "${declared}", which mode "${mode.id}" does not declare; treated as "${severity.id}"`)
+  }
+  const finding = {
+    severity: severity.id,
     category: text('category') === '' ? 'general' : text('category'),
     file: text('file'),
     line: Number.isInteger(value.line) ? value.line : null,
-    title: title === '' ? problem.split('\n')[0].slice(0, 120) : title,
-    problem,
-    impact: text('impact'),
-    trigger: text('trigger'),
-    suggestion: text('suggestion'),
-    evidence: text('evidence'),
+    title: text('title'),
   }
+  for (const field of mode.fields) finding[field.key] = text(field.key)
+  if (finding.title === '') {
+    // A finding that names no title is still a finding: the first words it did
+    // write become one, so the report never shows an anonymous entry.
+    const stated = mode.fields.map(field => finding[field.key]).find(entry => entry !== '')
+    finding.title = stated === undefined ? '' : stated.split('\n')[0].slice(0, 120)
+  }
+  return finding.title === '' ? undefined : finding
 }
 
-function parseVerdict(raw) {
+function parseVerdict(raw, mode, log) {
   const json = extractJsonObject(raw)
   if (json === undefined) return { failure: 'the reviewer returned no JSON object' }
   let parsed
@@ -1584,15 +2365,38 @@ function parseVerdict(raw) {
     declared: parsed.verdict === 'fail' || parsed.verdict === 'warn' ? parsed.verdict : 'pass',
     summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : '',
     findings: Array.isArray(parsed.findings)
-      ? parsed.findings.map(normalizeFinding).filter(Boolean)
+      ? parsed.findings.map(finding => normalizeFinding(finding, mode, log)).filter(Boolean)
       : [],
   }
 }
 
-function countBySeverity(findings) {
-  const counts = { blocker: 0, major: 0, minor: 0, nit: 0 }
-  for (const finding of findings) counts[finding.severity] += 1
+/** Findings per severity id of this mode, so a report counts in the mode's own words. */
+function countBySeverity(findings, mode) {
+  const counts = {}
+  for (const severity of mode.severities) counts[severity.id] = 0
+  for (const finding of findings) counts[finding.severity] = (counts[finding.severity] ?? 0) + 1
   return counts
+}
+
+/** How the mode names one severity, for a report line or a notice. */
+function severityLabel(mode, id) {
+  return mode.severities.find(entry => entry.id === id)?.label ?? id
+}
+
+/**
+ * The severity a mode falls back to when the reviewer names one the mode does
+ * not declare: the entry that claims least, so the substitution can never
+ * inflate the verdict. The order the file lists the table in decides nothing —
+ * a mode is free to write its severities strongest-last — and among entries that
+ * claim the same, the last one is the answer, which is the weakest end of a
+ * table written the usual way round.
+ */
+function weakestSeverity(mode) {
+  let weakest = mode.severities[mode.severities.length - 1]
+  for (const entry of mode.severities) {
+    if (VERDICT_WEIGHT[entry.verdict] <= VERDICT_WEIGHT[weakest.verdict]) weakest = entry
+  }
+  return weakest
 }
 
 function canonicalPath(path) {
@@ -1619,8 +2423,17 @@ function diffQuoteForms(diffText) {
   return forms
 }
 
-/** Keeps only findings that name a visible file, quote their proof, and state impact and trigger. */
-function verifyFindings(findings, servedText, visiblePaths) {
+/**
+ * Keeps only findings that name a visible file, quote their proof, and answer
+ * every field their mode made required.
+ *
+ * The first two checks are the plugin's own and no mode can relax them. The
+ * third is the mode's: `cr` requires the impact and the route that reaches the
+ * defect, `arc` requires the consequence and the alternative it proposes, and a
+ * mode the user wrote requires whatever it declared. Anything that fails is
+ * withheld and named, never dropped in silence.
+ */
+function verifyFindings(findings, servedText, visiblePaths, mode) {
   const forms = diffQuoteForms(servedText)
   const paths = new Set(visiblePaths.map(canonicalPath))
   const kept = []
@@ -1647,12 +2460,9 @@ function verifyFindings(findings, servedText, visiblePaths) {
       withheld.push({ ...claim, reason: `quoted evidence does not occur in the diff or the reads: ${clamp(missing, 120)}` })
       continue
     }
-    if (finding.impact === '') {
-      withheld.push({ ...claim, reason: 'no impact stated — what this causes was not said' })
-      continue
-    }
-    if (finding.trigger === '') {
-      withheld.push({ ...claim, reason: 'no trigger scenario — how this is reached was not shown' })
+    const unanswered = mode.fields.find(field => field.required && finding[field.key] === '')
+    if (unanswered !== undefined) {
+      withheld.push({ ...claim, reason: `missing required field "${unanswered.key}" (${unanswered.label === '' ? unanswered.key : unanswered.label}) — a finding that cannot state it is not published` })
       continue
     }
     kept.push(finding)
@@ -1661,23 +2471,43 @@ function verifyFindings(findings, servedText, visiblePaths) {
   return { kept, withheld }
 }
 
-function verdictFromFindings(findings) {
-  if (findings.some(finding => finding.severity === 'blocker' || finding.severity === 'major')) return 'fail'
-  return findings.length > 0 ? 'warn' : 'pass'
+/** The verdict the surviving findings force, through the severity table of their mode. */
+function verdictFromFindings(findings, mode) {
+  let verdict = 'pass'
+  for (const finding of findings) {
+    const weight = mode.severities.find(entry => entry.id === finding.severity)?.verdict ?? 'warn'
+    if (weight === 'fail') return 'fail'
+    if (weight === 'warn') verdict = 'warn'
+  }
+  return verdict
 }
 
-function renderReport({ verdict, summary, findings, withheld, stats, route }) {
-  const counts = countBySeverity(findings)
-  const head = verdict === 'pass' ? 'PASS' : verdict === 'warn' ? 'WARN' : 'FAIL'
+/**
+ * The thinking level, when one was asked for, as both the report and the notice
+ * write it. A run that asked for nothing says nothing: the level in force is the
+ * provider's own default, and naming it here would claim a choice nobody made.
+ */
+function effortNote(route) {
+  return route.reasoningEffort === undefined ? '' : ` · thinking: ${route.reasoningEffort}`
+}
+
+function renderReport({ verdict, summary, findings, withheld, stats, route, mode }) {
+  const counts = countBySeverity(findings, mode)
+  const head = mode.verdicts[verdict] ?? verdict.toUpperCase()
+  const detail = mode.severities
+    .filter(severity => counts[severity.id] > 0)
+    .map(severity => `${severity.label} ${counts[severity.id]}`)
+    .join(', ')
   const ignoreRules = stats.ignore === undefined ? '' : ignoreRuleLine(stats.ignore)
   const lines = [
-    `## Code review — ${head}`,
+    `## ${mode.label} — ${head}`,
     '',
     summary === '' ? '(no summary returned)' : summary,
     '',
-    `- verdict: **${verdict}** · proven findings: ${findings.length}` +
-      ` (blocker ${counts.blocker}, major ${counts.major}, minor ${counts.minor}, nit ${counts.nit})` +
+    `- verdict: **${head}** (${verdict}) · proven findings: ${findings.length}` +
+      ` (${detail === '' ? 'none' : detail})` +
       (withheld.length === 0 ? '' : ` · withheld as unprovable: ${withheld.length}`),
+    `- mode: ${mode.label} (${mode.id}) · prompt: ${mode.promptFrom === 'file' ? 'config.json' : "this release's default"}`,
     `- source: ${stats.sourceLabel}`,
     `- change set: ${stats.files} file(s), +${stats.added} / -${stats.deleted}, reviewed ${stats.reviewed}` +
       (stats.skipped.length === 0 ? '' : `, left out ${stats.skipped.length}`),
@@ -1693,24 +2523,30 @@ function renderReport({ verdict, summary, findings, withheld, stats, route }) {
     ...(stats.context === undefined || stats.context.calls === 0
       ? []
       : [`- project context read: ${stats.context.calls} tool call(s), ${stats.context.files.length} file(s)`]),
-    `- reviewer: ${route.provider}/${route.model}` +
+    `- reviewer: ${route.provider}/${route.model}${effortNote(route)}` +
       (stats.reviewerFallback === true ? ' · degraded retry (no project access, smaller output cap)' : ''),
   ]
   if (withheld.length > 0) {
     lines.push('', '_The reviewer also raised claims it could not prove from the diff. They are listed at the end and carry no verdict._')
   }
+  // The finding body is the mode's field list, in the mode's order, labelled the
+  // way the mode labels it: an empty label renders the text bare, a `block` field
+  // is quoted code. The evidence is one of those fields, so it is gated wherever
+  // it sits in the list.
   findings.forEach((finding, index) => {
     const where = finding.file === '' ? '' : ` — ${finding.file}${finding.line === null ? '' : `:${finding.line}`}`
-    lines.push('', `### ${index + 1}. [${finding.severity}] ${finding.title}${where}`, `category: ${finding.category}`, '')
-    if (finding.problem !== '') lines.push(finding.problem)
-    if (finding.impact !== '') lines.push('', `**Impact:** ${finding.impact}`)
-    if (finding.trigger !== '') lines.push('', `**How it is reached:** ${finding.trigger}`)
-    if (finding.suggestion !== '') lines.push('', `**Fix:** ${finding.suggestion}`)
-    if (finding.evidence !== '') lines.push('', '**Evidence:**', '', '```diff', finding.evidence, '```')
+    lines.push('', `### ${index + 1}. [${severityLabel(mode, finding.severity)}] ${finding.title}${where}`, `category: ${finding.category}`, '')
+    for (const field of mode.fields) {
+      const value = finding[field.key]
+      if (typeof value !== 'string' || value === '') continue
+      if (field.block) lines.push('', ...(field.label === '' ? [] : [`**${field.label}:**`, '']), '```diff', value, '```')
+      else if (field.label === '') lines.push(value)
+      else lines.push('', `**${field.label}:** ${value}`)
+    }
   })
   if (withheld.length > 0) {
     lines.push('', '### Withheld as unprovable', '')
-    for (const item of withheld) lines.push(`- [${item.severity}] ${item.title} — ${item.reason}`)
+    for (const item of withheld) lines.push(`- [${severityLabel(mode, item.severity)}] ${item.title} — ${item.reason}`)
   }
   if (stats.skipped.length > 0) {
     lines.push('', '### Left out', '')
@@ -1719,13 +2555,14 @@ function renderReport({ verdict, summary, findings, withheld, stats, route }) {
   return lines.join('\n')
 }
 
-function noticeSummary({ verdict, findings, withheld, stats }) {
-  const counts = countBySeverity(findings)
-  const detail = SEVERITIES.filter(severity => counts[severity] > 0)
-    .map(severity => `${counts[severity]} ${severity}`)
+function noticeSummary({ verdict, findings, withheld, stats, mode }) {
+  const counts = countBySeverity(findings, mode)
+  const detail = mode.severities
+    .filter(severity => counts[severity.id] > 0)
+    .map(severity => `${counts[severity.id]} ${severity.label}`)
     .join(', ')
   const parts = [
-    `code review: ${verdict}`,
+    `code review [${mode.id}]: ${verdict}`,
     `${findings.length} proven finding(s)${detail === '' ? '' : ` (${detail})`}`,
     `${stats.reviewed}/${stats.files} file(s)`,
   ]
@@ -1738,17 +2575,18 @@ function noticeSummary({ verdict, findings, withheld, stats }) {
 }
 
 /** The report as the Agent reads it: no payload, and plainly a notice rather than a request. */
-function renderAgentNotice({ verdict, summary, findings, withheld, stats, route }) {
+function renderAgentNotice({ verdict, summary, findings, withheld, stats, route, mode }) {
   const lines = [
-    "[code-review] The user ran /review on the code changes of this workspace. The same report is rendered to them as a card. This is a notice, not a request: do not change code unless the user asks you to.",
+    `[code-review] The user ran /review mode=${mode.id} (${mode.label}) on the code changes of this workspace. The same report is rendered to them as a card. This is a notice, not a request: do not change code unless the user asks you to.`,
     '',
+    `mode: ${mode.label} (${mode.id}) · verdict: ${verdict}`,
     `source: ${stats.sourceLabel}`,
     `${stats.files} file(s), +${stats.added} / -${stats.deleted}, reviewed ${stats.reviewed}` +
       ` · proven findings: ${findings.length} · withheld as unprovable: ${withheld.length}`,
     ...(stats.ignore === undefined || stats.ignore.count === 0
       ? []
       : [`excluded by the ignore rules before the review: ${stats.ignore.count} file(s) — ${ignoreSampleText(stats.ignore)}`]),
-    `reviewer: ${route.provider}/${route.model}`,
+    `reviewer: ${route.provider}/${route.model}${effortNote(route)}`,
     ...(stats.recordBehind > 0
       ? [`note: this reviews turn ${stats.turn}; ${stats.recordBehind} newer recorded turn(s) have no comparison in this Host process`]
       : []),
@@ -1765,17 +2603,18 @@ function renderAgentNotice({ verdict, summary, findings, withheld, stats, route 
     lines.push('', 'Proven findings')
     findings.forEach((finding, index) => {
       const where = finding.file === '' ? '' : ` — ${finding.file}${finding.line === null ? '' : `:${finding.line}`}`
-      lines.push(`${index + 1}. [${finding.severity}] ${finding.category} — ${finding.title}${where}`)
-      if (finding.problem !== '') lines.push(`   problem: ${finding.problem}`)
-      if (finding.impact !== '') lines.push(`   impact: ${finding.impact}`)
-      if (finding.trigger !== '') lines.push(`   reached by: ${finding.trigger}`)
-      if (finding.suggestion !== '') lines.push(`   fix: ${finding.suggestion}`)
-      if (finding.evidence !== '') lines.push(`   evidence: ${finding.evidence.split('\n').join(' | ')}`)
+      lines.push(`${index + 1}. [${severityLabel(mode, finding.severity)}] ${finding.category} — ${finding.title}${where}`)
+      for (const field of mode.fields) {
+        const value = finding[field.key]
+        if (typeof value !== 'string' || value === '') continue
+        const label = field.label === '' ? field.key : field.label.toLowerCase()
+        lines.push(`   ${label}: ${field.block ? value.split('\n').join(' | ') : value}`)
+      }
     })
   }
   if (withheld.length > 0) {
     lines.push('', 'Raised but withheld as unprovable (not part of the verdict)')
-    for (const item of withheld) lines.push(`- [${item.severity}] ${item.title} — ${item.reason}`)
+    for (const item of withheld) lines.push(`- [${severityLabel(mode, item.severity)}] ${item.title} — ${item.reason}`)
   }
   return lines.join('\n')
 }
@@ -1807,15 +2646,29 @@ export function apply(ctx) {
     warn: message => console.warn(`[code-review] ${message}`),
   }
 
+  // A fresh harness home has no settings file at all, and the file a user is
+  // told to edit has to exist before the first `/review` asks them to edit it.
+  ensureSettingsFile(log)
+
   ctx.effect(() => ctx.commands.register({
     name: 'review',
-    description: 'Review the code changes of this workspace and show a report card.',
-    input: { hint: '[full|session] [provider=<id>] [model=<id>] [ignored=<pattern,…>] [focus message]' },
+    description: 'Review the changes of this workspace in one of its modes and show a report card.',
+    input: { hint: '[full|session] [mode=<id>] [provider=<id>] [model=<id>] [reasoningEffort=<id>] [ignored=<pattern,…>] [focus message]' },
     handler: async ({ agent, rawInput, signal }) => {
       const invocation = parseInvocation(rawInput)
       const overrides = invocation.overrides
       const scope = invocation.scope === 'session' ? 'session' : 'full'
-      const settings = readSettings(log)
+      // The file is read, completed and then read again per run: a mode the user
+      // just wrote is available on the next command, with no restart.
+      const fileSettings = loadSettings(log)
+      const resolvedMode = resolveMode(fileSettings, overrides, log)
+      if (resolvedMode.failure !== undefined) {
+        return { kind: 'error', text: `code-review: ${resolvedMode.failure}` }
+      }
+      const mode = resolvedMode.mode
+      // A mode is a preset: its settings win over the file's own and lose to
+      // what was typed after `/review`.
+      const settings = { ...fileSettings, ...mode.settings }
       const focus = clamp(invocation.message, positiveInt(settings.maxHintChars, DEFAULTS.maxHintChars))
       const provider = overrides.provider ?? settings.provider
       const model = overrides.model ?? settings.model
@@ -1827,8 +2680,19 @@ export function apply(ctx) {
         return { kind: 'error', text: 'code-review: this session has no readable change record.' }
       }
       if (reviewerProvider === undefined || reviewerModel === undefined) {
-        return { kind: 'error', text: 'code-review: no reviewer route — set "provider"/"model" in DSH_HOME/code-review/config.json or pass provider=… model=… .' }
+        return { kind: 'error', text: `code-review: no reviewer route — set "provider"/"model" in ${configPath()} or pass provider=… model=… .` }
       }
+
+      // The route is the whole model selection — who reviews, and how hard it
+      // thinks — so everything downstream reads one object.
+      const reasoningEffort = resolveReasoningEffort(mode, fileSettings, overrides)
+      const route = {
+        provider: reviewerProvider,
+        model: reviewerModel,
+        ...reasoningEffort === undefined ? {} : { reasoningEffort },
+      }
+      const effortFailure = await checkReasoningEffort(ctx, route, reasoningEffort, signal)
+      if (effortFailure !== undefined) return { kind: 'error', text: `code-review: ${effortFailure}` }
 
       const limits = {
         maxFiles: positiveInt(settings.maxFiles, DEFAULTS.maxFiles),
@@ -1949,11 +2813,12 @@ export function apply(ctx) {
         focus,
         language: firstNonEmpty(overrides.language, settings.language) ?? '',
         cwd,
+        mode,
         primary,
         others,
       })
+      const system = systemPromptFor(mode)
 
-      const route = { provider: reviewerProvider, model: reviewerModel }
       const readerOn = settings.projectAccess === true
       const maxToolCalls = positiveInt(settings.maxToolCalls, DEFAULTS.maxToolCalls)
       const timeoutMs = positiveInt(settings.timeoutMs, DEFAULTS.timeoutMs)
@@ -1965,7 +2830,12 @@ export function apply(ctx) {
         ` maxToolCalls=${maxToolCalls}, timeoutMs=${timeoutMs}, projectAccess=${readerOn}`,
       )
       log.info(
+        `mode=${mode.id} (${mode.label}, prompt: ${mode.promptFrom === 'file' ? 'config.json' : "this release's default"},` +
+        ` ${mode.fields.length} field(s), ${mode.severities.map(severity => severity.id).join('/')})`,
+      )
+      log.info(
         `reviewing ${stats.reviewed}/${stats.files} file(s) (${stats.scope} scope) via ${route.provider}/${route.model}` +
+        (route.reasoningEffort === undefined ? '' : ` (thinking: ${route.reasoningEffort})`) +
         (readerOn ? ` with read-only project access (up to ${maxToolCalls} reads)` : '') +
         (focus === '' ? '' : ` · focus: ${clamp(focus, 80)}`),
       )
@@ -1989,6 +2859,7 @@ export function apply(ctx) {
           },
           policy: collected.policy,
           prompt,
+          system,
           root: collected.summary.cwd,
           signal: combined,
           deadlineAt,
@@ -2008,7 +2879,7 @@ export function apply(ctx) {
         keptBytes: review.contextBytes,
       }
       stats.reviewerFallback = review.fellBack === true
-      const parsed = parseVerdict(raw)
+      const parsed = parseVerdict(raw, mode, log)
       if (parsed.failure !== undefined) {
         log.warn(`unusable reviewer output: ${parsed.failure}`)
         return { kind: 'error', text: `code-review: ${parsed.failure}. Raw output:\n\n${clamp(raw, 4000)}` }
@@ -2019,8 +2890,9 @@ export function apply(ctx) {
         parsed.findings,
         haystack,
         [...collected.paths, ...review.files],
+        mode,
       )
-      const verdict = verdictFromFindings(kept)
+      const verdict = verdictFromFindings(kept, mode)
       const noticeMode = NOTIFY_MODES.has(settings.notifyAgent) ? settings.notifyAgent : DEFAULTS.notifyAgent
       const reportInput = {
         verdict,
@@ -2029,9 +2901,18 @@ export function apply(ctx) {
         withheld,
         stats,
         route,
+        mode,
       }
       const payload = {
         schema: SCHEMA,
+        mode: {
+          id: mode.id,
+          label: mode.label,
+          promptFrom: mode.promptFrom,
+          verdict: { id: verdict, label: mode.verdicts[verdict] ?? verdict },
+          severities: mode.severities.map(severity => ({ id: severity.id, label: severity.label, tone: severity.tone })),
+          fields: mode.fields.map(field => ({ key: field.key, label: field.label, block: field.block })),
+        },
         source: stats.source,
         base: stats.base,
         scope: stats.scope,
@@ -2048,7 +2929,7 @@ export function apply(ctx) {
       }
 
       log.info(
-        `review done: ${verdict} (reviewer declared ${parsed.declared}), ` +
+        `review done: ${mode.id} ${verdict} (reviewer declared ${parsed.declared}), ` +
         `${kept.length} proven finding(s), ${withheld.length} withheld`,
       )
       notifyAgent(agent, noticeMode, {
@@ -2061,5 +2942,5 @@ export function apply(ctx) {
     },
   }), 'code-review: /review command')
 
-  log.info('code-review ready: /review audits the uncommitted changes in this workspace')
+  log.info('code-review ready: /review audits the uncommitted changes of this workspace in the mode you name')
 }
