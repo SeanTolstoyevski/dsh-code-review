@@ -2,8 +2,10 @@
 #
 # The row id is how a higher-priority layer (the profile's own cordis.patch.yml)
 # would override this plugin's configuration. The plugin declares no Config
-# schema: its settings live in DSH_HOME/code-review/config.json and are re-read
-# on every `/review`, so tuning needs no restart.
+# schema: its settings — and the modes it runs in — live in
+# DSH_HOME/code-review/config.json, created with the defaults on first load and
+# completed on every load, so a fresh machine has a file to edit and a mode added
+# to it is available on the next `/review`, with no restart.
 
 - insert:
     - id: code-review

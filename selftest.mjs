@@ -1,9 +1,10 @@
 /**
  * Self-test for both halves: drives the `/review` handler against a fake Context
  * and asserts the whole path — diff collection, the read-only project reader
- * (tools, budget, sandbox), the evidence gate, settings, the notice that reaches
- * the Agent when it is opted in, and every failure mode. It then loads the Client
- * artifact and asserts the card's copy helpers and its outcome faces.
+ * (tools, budget, sandbox), the evidence gate, the modes and the settings file,
+ * the notice that reaches the Agent when it is opted in, and every failure mode.
+ * It then loads the Client artifact and asserts the card's copy helpers, its
+ * mode-driven body and its outcome faces.
  *
  * The reviewer model is scripted: each entry answers one model call, either with
  * text or with tool calls, so the loop is exercised without a network call.
@@ -12,11 +13,11 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { apply } from './index.js'
+import { apply, BUILT_IN_MODES, DEFAULTS } from './index.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -193,18 +194,73 @@ function realSubprocess() {
   }
 }
 
+/** `DSH_HOME/code-review/config.json` for a harness home a test created. */
+function settingsPath(home) {
+  return join(home, 'code-review', 'config.json')
+}
+
+/** Run `fn` with `DSH_HOME` pointed at `home`, restoring the previous value after. */
+async function withDshHome(home, fn) {
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    return await fn(home)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+}
+
 /** Run `fn` with `DSH_HOME` pointed at a fresh directory holding this config. */
 async function withSettings(settings, fn) {
   const home = mkdtempSync(join(tmpdir(), 'dsh-code-review-home-'))
   mkdirSync(join(home, 'code-review'), { recursive: true })
-  writeFileSync(join(home, 'code-review', 'config.json'), JSON.stringify(settings))
-  const previous = process.env.DSH_HOME
-  process.env.DSH_HOME = home
+  writeFileSync(settingsPath(home), JSON.stringify(settings))
+  return withDshHome(home, fn)
+}
+
+/** Run `fn` with `DSH_HOME` pointed at a fresh directory that holds no settings file at all. */
+async function withEmptyHome(fn) {
+  return withDshHome(mkdtempSync(join(tmpdir(), 'dsh-code-review-home-')), fn)
+}
+
+/**
+ * The settings block README documents. The file the plugin creates on a fresh
+ * machine and the block a user reads there must not drift apart, so the test
+ * asserts one against the other.
+ */
+function readmeDefaults() {
+  const readme = readFileSync(join(HERE, 'README.md'), 'utf8')
+  const section = readme.slice(readme.indexOf('## Configuration'))
+  const fence = section.indexOf('```json')
+  assert.ok(fence >= 0, 'README documents the settings file as a JSON block')
+  const body = section.slice(fence + '```json'.length)
+  return JSON.parse(body.slice(0, body.indexOf('```')))
+}
+
+/**
+ * The mode entry README documents — one key per thing a mode can decide. The
+ * built-in modes and the entries a fresh file gets must match it key for key,
+ * so a reader can trust the table without reading this file.
+ */
+function readmeModeShape() {
+  const readme = readFileSync(join(HERE, 'README.md'), 'utf8')
+  const section = readme.slice(readme.indexOf('## Modes'))
+  const fence = section.indexOf('```json')
+  assert.ok(fence >= 0, 'README documents a mode entry as a JSON block')
+  const body = section.slice(fence + '```json'.length)
+  return JSON.parse(body.slice(0, body.indexOf('```')))
+}
+
+/** Run `fn` with `console.warn` collected; every plugin diagnostic goes through it. */
+async function captureWarnings(fn) {
+  const warnings = []
+  const original = console.warn
+  console.warn = message => { warnings.push(String(message)) }
   try {
-    return await fn()
+    return { value: await fn(), warnings }
   } finally {
-    if (previous === undefined) delete process.env.DSH_HOME
-    else process.env.DSH_HOME = previous
+    console.warn = original
   }
 }
 
@@ -242,10 +298,19 @@ const PROVEN = {
   trigger: 'A game replayed from a PGN whose last move is incomplete reaches ApplyMove with a nil board.',
   evidence: '+new',
 }
+/** The same proof, in the vocabulary the architecture mode declares. */
+const ARC_FINDING = {
+  severity: 'high', category: 'responsibility', file: 'internal/chessx/board.go', line: 13,
+  title: 'Move the reset out of Apply', problem: 'Apply resets a board it does not own',
+  consequence: 'The caller holds a board it believes is unchanged.',
+  alternative: 'Let the caller reset the board before Apply is called.',
+  evidence: '+new',
+}
 /** A model reply carrying one payload. */
 const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ verdict, summary, findings }) })
 
-// 1 — a proven finding survives the gate and reaches both the report and the payload.
+// 1 — a proven finding survives the gate and reaches both the report and the
+// payload, in the default mode's own vocabulary.
 {
   const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('fail', [PROVEN], 'Nil board.')] })
   assert.equal(h.name, 'review')
@@ -256,8 +321,15 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   assert.ok(!prompt.includes('Board ı hesapla'), 'the session message is never read by the reviewer')
   assert.ok(!prompt.includes('most recent request'), 'no conversation intent section at all')
   assert.ok(prompt.includes('verbatim evidence quote') || prompt.includes('verbatim'), 'the prompt states the evidence bar')
+  const system = h.seen.prompts[0].system
+  assert.ok(system.includes('senior code reviewer'), 'the cr persona is the default one')
+  assert.ok(system.includes('"impact"') && system.includes('"trigger"'), 'and its fields are the contract’s')
+  assert.ok(system.includes('"blocker"|"major"|"minor"|"nit"'), 'with its severity vocabulary in the JSON shape')
+  assert.ok(system.includes('## Evidence bar'), 'and the gate no mode can change')
+  assert.ok(system.includes('error-handling'), 'and its categories')
   const payload = payloadOf(result.text)
-  assert.equal(payload.schema, 'code-review/1')
+  assert.equal(payload.schema, 'code-review/2')
+  assert.equal(payload.mode.id, 'cr')
   assert.equal(payload.verdict, 'fail')
   assert.equal(payload.findings.length, 1)
   assert.equal(payload.findings[0].evidence, '+new')
@@ -265,6 +337,8 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   assert.equal(payload.stats.reviewed, 1)
   assert.deepEqual(payload.stats.skipped, [{ file: 'assets/logo.png', reason: 'binary' }])
   assert.ok(result.text.includes('**Evidence:**'), 'the report shows the evidence')
+  assert.ok(result.text.includes(`**Fix:** ${PROVEN.suggestion}`), 'and labels the fields the mode declared')
+  assert.ok(result.text.includes(PROVEN.problem), 'the statement it leads with needs no label')
 }
 
 // 2 — a reviewer that contradicts itself is reconciled from its own findings.
@@ -710,7 +784,8 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   })
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.findings.length, 0)
-  assert.ok(payload.withheld[0].reason.includes('no trigger scenario'), payload.withheld[0].reason)
+  assert.ok(payload.withheld[0].reason.includes('"trigger"'), payload.withheld[0].reason)
+  assert.ok(payload.withheld[0].reason.includes('How it is reached'), payload.withheld[0].reason)
 }
 
 // 27 — a finding that does not say what it causes is withheld.
@@ -722,7 +797,8 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   })
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.findings.length, 0)
-  assert.ok(payload.withheld[0].reason.includes('no impact stated'), payload.withheld[0].reason)
+  assert.ok(payload.withheld[0].reason.includes('"impact"'), payload.withheld[0].reason)
+  assert.ok(payload.withheld[0].reason.includes('Impact'), payload.withheld[0].reason)
 }
 
 // 28 — impact and trigger reach the payload, the report and the opt-in notice.
@@ -737,7 +813,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
     assert.ok(result.text.includes(`**How it is reached:** ${PROVEN.trigger}`), 'the report shows the trigger')
     const notice = h.seen.steer[0].content[0].text
     assert.ok(notice.includes(`impact: ${PROVEN.impact}`), 'the notice carries the impact')
-    assert.ok(notice.includes(`reached by: ${PROVEN.trigger}`), 'the notice carries the trigger')
+    assert.ok(notice.includes(`how it is reached: ${PROVEN.trigger}`), 'the notice carries the trigger')
   })
 }
 
@@ -1031,7 +1107,7 @@ async function loadClientApi() {
 {
   const api = await loadClientApi()
   const payload = {
-    schema: 'code-review/1',
+    schema: 'code-review/2',
     verdict: 'fail',
     findings: [{ severity: 'minor', title: 'fence', evidence: '+```json' }],
     withheld: [],
@@ -1292,8 +1368,8 @@ function subdirectoryFixture() {
   const api = await loadClientApi()
   assert.deepEqual(
     Object.keys(api.__test).sort(),
-    ['findingText', 'parsePayload', 'readOutcome', 'reportOf'],
-    'the Client half exposes copy helpers only — there is no send path to misuse',
+    ['findingText', 'modeOf', 'parsePayload', 'readOutcome', 'reportOf', 'severityOf'],
+    'the Client half exposes copy helpers and the mode reader only — there is no send path to misuse',
   )
 
   // The face decides what the card claims. A command that succeeded but whose
@@ -1324,6 +1400,30 @@ function subdirectoryFixture() {
     '### 1. [nit] No file',
     'a finding that names no file stays clean',
   )
+
+  // The copy follows the mode the payload describes: an arc finding pastes the
+  // way the arc card drew it, and a field that mode does not declare is not
+  // copied at all.
+  const arcMode = api.__test.modeOf({
+    mode: {
+      id: 'arc',
+      label: 'Architecture review',
+      severities: [{ id: 'high', label: 'high', tone: 'error' }],
+      fields: [
+        { key: 'problem', label: '', block: false },
+        { key: 'consequence', label: 'Consequence', block: false },
+        { key: 'evidence', label: 'Evidence', block: true },
+      ],
+    },
+  })
+  const arcPaste = api.__test.findingText(
+    { severity: 'high', title: 'Split it', file: 'a.go', problem: 'p', consequence: 'c', impact: 'not declared', evidence: '+x' },
+    0,
+    arcMode,
+  )
+  assert.ok(arcPaste.startsWith('### 1. [high] Split it — a.go'), arcPaste)
+  assert.ok(arcPaste.includes('**Consequence:** c'), arcPaste)
+  assert.ok(!arcPaste.includes('not declared'), 'a field the mode does not declare is not part of the finding')
 }
 
 // 50 — end to end: the user receives the whole review, and the agent receives nothing.
@@ -1441,9 +1541,11 @@ function subdirectoryFixture() {
     'nothing on the card does anything but copy or collapse',
   )
   assert.ok(full.texts.includes('a.go:3'), 'the finding names its location')
-  assert.ok(full.texts.includes('label.impact: i'), 'and carries its impact')
-  assert.ok(full.texts.includes('label.trigger: tr'), 'and how it is reached')
-  assert.ok(full.texts.includes('label.evidence'), 'and the evidence behind it')
+  // A payload without a `mode` block is drawn with the vocabulary the plugin
+  // shipped before modes: the fallback is what keeps an old card readable.
+  assert.ok(full.texts.includes('Impact: i'), 'and carries its impact')
+  assert.ok(full.texts.includes('How it is reached: tr'), 'and how it is reached')
+  assert.ok(full.texts.includes('Evidence'), 'and the evidence behind it')
   assert.ok(full.texts.includes('action.yours'), 'and says the report is the reader\'s')
 }
 
@@ -2010,6 +2112,590 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   const payload = payloadOf(second.text)
   assert.equal(payload.stats.reviewed, 1, 'the session file is reviewed')
   assert.equal(payload.stats.ignore.count, 0, "another file's exclusion is not reported as this run's")
+}
+
+// 69 — a harness home that has never held a settings file gets one, written by
+// the plugin itself, and the run that created it is the run it decides.
+{
+  await withEmptyHome(async home => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
+    const file = settingsPath(home)
+    assert.ok(existsSync(file), 'the plugin creates the file a new machine never had')
+    const created = JSON.parse(readFileSync(file, 'utf8'))
+    const { modes, ...documented } = created
+    const readme = readmeDefaults()
+    assert.deepEqual(documented, readme, 'the settings the file lists are exactly the block README documents')
+    assert.deepEqual(Object.keys(documented), Object.keys(readme), 'in the documented order')
+    assert.deepEqual(
+      Object.keys(created),
+      [...Object.keys(readme), 'modes'],
+      'and the modes come last, so the block a reader knows is unchanged',
+    )
+    assert.deepEqual(modes, BUILT_IN_MODES, 'with the modes this release ships, prompts and all')
+    const shape = readmeModeShape()
+    assert.deepEqual(Object.keys(modes.cr), Object.keys(shape), 'a mode entry is what README says a mode entry is')
+    assert.deepEqual(Object.keys(modes.arc), Object.keys(shape))
+    assert.deepEqual(Object.keys(modes.cr.fields[0]), Object.keys(shape.fields[0]), 'and so is a field')
+    assert.deepEqual(Object.keys(modes.cr.severities[0]), Object.keys(shape.severities[0]), 'and a severity')
+    assert.deepEqual(Object.keys(DEFAULTS), Object.keys(readme), 'every documented key is one the plugin reads')
+    const payload = payloadOf((await h.invoke('')).text)
+    assert.deepEqual(
+      payload.reviewer,
+      { provider: 'deepseek-official', model: 'deepseek-flash' },
+      'empty provider/model reuse the agent route',
+    )
+    assert.equal(payload.mode.id, 'cr', 'the default mode is the code review')
+    assert.equal(payload.mode.promptFrom, 'default', 'and its prompt is still the one this release ships')
+    assert.deepEqual(
+      payload.stats.skipped,
+      [{ file: 'assets/logo.png', reason: 'binary' }],
+      'the written defaults decided the run',
+    )
+  })
+}
+
+// 70 — a settings file removed while the harness is up is created again by the
+// run that needs it, instead of leaving the user without one until a restart.
+{
+  await withEmptyHome(async home => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
+    const file = settingsPath(home)
+    assert.ok(existsSync(file), 'the plugin load created it')
+    unlinkSync(file)
+    const payload = payloadOf((await h.invoke('')).text)
+    assert.ok(existsSync(file), 'the run put it back')
+    const created = JSON.parse(readFileSync(file, 'utf8'))
+    const { modes, ...settings } = created
+    assert.deepEqual(settings, readmeDefaults(), 'with the defaults again')
+    assert.deepEqual(modes, BUILT_IN_MODES, 'and the built-in modes')
+    assert.equal(payload.stats.reviewed, 1, 'and the run itself succeeded')
+  })
+}
+
+// 71 — a hand-written file is completed, never overwritten: what the user wrote
+// still decides the run, a key of the user's own and the file's own order stand,
+// and a second load does not write a byte.
+{
+  await withEmptyHome(async home => {
+    const file = settingsPath(home)
+    mkdirSync(dirname(file), { recursive: true })
+    const handwritten = `${JSON.stringify({ maxFiles: 1, keepMe: 'mine' }, null, 2)}\n`
+    writeFileSync(file, handwritten)
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
+    const payload = payloadOf((await h.invoke('')).text)
+    assert.deepEqual(
+      payload.stats.skipped,
+      [{ file: 'assets/logo.png', reason: 'over-file-limit' }],
+      'the hand-written value decided the run',
+    )
+    const completed = JSON.parse(readFileSync(file, 'utf8'))
+    assert.equal(completed.maxFiles, 1, 'and it is still there after the sync')
+    assert.equal(completed.keepMe, 'mine', 'a key of the user\'s own survives the sync')
+    assert.deepEqual(Object.keys(completed).slice(0, 2), ['maxFiles', 'keepMe'], 'the file keeps its own order')
+    assert.deepEqual(Object.keys(completed.modes), ['cr', 'arc'], 'and gains the modes it never had')
+    const after = readFileSync(file, 'utf8')
+    harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
+    assert.equal(readFileSync(file, 'utf8'), after, 'a file with nothing missing is not rewritten at all')
+  })
+}
+
+// 72 — a file that does not parse is reported and left exactly as it is: the
+// plugin never repairs a user's file behind their back.
+{
+  await withEmptyHome(async home => {
+    const file = settingsPath(home)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, '{ oops')
+    const { value, warnings } = await captureWarnings(async () => {
+      const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
+      return payloadOf((await h.invoke('')).text)
+    })
+    assert.equal(readFileSync(file, 'utf8'), '{ oops', 'the broken file is untouched')
+    assert.ok(warnings.some(line => line.includes('is not valid JSON')), warnings.join('\n'))
+    assert.deepEqual(
+      value.stats.skipped,
+      [{ file: 'assets/logo.png', reason: 'binary' }],
+      'the run fell back to the defaults',
+    )
+    assert.equal(value.mode.id, 'cr', 'and the default mode is still there')
+  })
+}
+
+// 73 — a home the plugin cannot write to is a warning, never a failed review.
+{
+  const blocker = join(mkdtempSync(join(tmpdir(), 'dsh-code-review-blocked-')), 'not-a-directory')
+  writeFileSync(blocker, 'a file where the directory of the settings file would go\n')
+  await withDshHome(join(blocker, 'home'), async () => {
+    const { value, warnings } = await captureWarnings(async () => {
+      const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
+      return payloadOf((await h.invoke('')).text)
+    })
+    assert.ok(warnings.some(line => line.includes('cannot create')), warnings.join('\n'))
+    assert.deepEqual(
+      value.stats.skipped,
+      [{ file: 'assets/logo.png', reason: 'binary' }],
+      'the defaults still reviewed the change set',
+    )
+  })
+}
+
+// 74 — mode=arc runs the architecture role: its persona, its vocabulary, its
+// own word for the verdict, and the same contract no mode can change.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [answer('fail', [ARC_FINDING], 'The reset belongs to the caller.')],
+  })
+  const result = await h.invoke('mode=arc')
+  assert.equal(result.kind, 'success', result.text)
+  const request = h.seen.prompts[0]
+  assert.ok(request.system.includes('staff-level software architect'), 'the arc persona is sent')
+  assert.ok(!request.system.includes('senior code reviewer'), 'and not the code review one')
+  assert.ok(request.system.includes('## Evidence bar'), 'the contract rides along with every persona')
+  assert.ok(request.system.includes('"consequence"'), 'the contract asks for the fields arc declares')
+  assert.ok(request.system.includes('module-boundary'), 'and lists the categories it declared')
+  const prompt = request.messages[0].content[0].text
+  assert.ok(prompt.includes('- mode: Architecture review (arc)'), 'the change set names the mode')
+  assert.ok(prompt.includes('## Mode task (Architecture review)'), 'and carries the mode task')
+  assert.ok(prompt.includes('Judge the architecture of this change set'), 'which is arc\'s own assignment')
+
+  const payload = payloadOf(result.text)
+  assert.equal(payload.mode.id, 'arc')
+  assert.equal(payload.mode.label, 'Architecture review')
+  assert.equal(payload.mode.promptFrom, 'default', 'the arc prompt is still the one this release ships')
+  assert.deepEqual(payload.mode.fields.map(field => field.key), ['problem', 'consequence', 'alternative', 'evidence'])
+  assert.deepEqual(payload.mode.severities.map(severity => severity.id), ['high', 'medium', 'low'])
+  assert.deepEqual(payload.mode.severities.map(severity => severity.tone), ['error', 'warn', 'muted'])
+  assert.equal(payload.findings.length, 1, 'the architecture finding survives its own gate')
+  assert.equal(payload.findings[0].consequence, ARC_FINDING.consequence)
+  assert.equal(payload.findings[0].alternative, ARC_FINDING.alternative)
+  assert.ok(result.text.includes('## Architecture review — decide before merge'), 'the report is headed by the mode')
+  assert.ok(result.text.includes(`**Consequence:** ${ARC_FINDING.consequence}`), 'and labelled by it')
+  assert.ok(result.text.includes(`**Alternative:** ${ARC_FINDING.alternative}`))
+  assert.ok(result.text.includes('(high 1)'), 'the severity counts use the mode\'s names')
+}
+
+// 75 — the fields a mode requires are what the gate enforces: arc asks for the
+// consequence and the alternative it proposes, not for a code review's impact.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [answer('fail', [{ ...ARC_FINDING, alternative: '' }])],
+  })
+  const payload = payloadOf((await h.invoke('mode=arc')).text)
+  assert.equal(payload.findings.length, 0)
+  assert.ok(payload.withheld[0].reason.includes('"alternative"'), payload.withheld[0].reason)
+  assert.ok(payload.withheld[0].reason.includes('Alternative'), payload.withheld[0].reason)
+  assert.equal(payload.verdict, 'pass', 'a withheld finding never carries a verdict')
+
+  // The same finding with an impact but no consequence is still unproven here:
+  // the mode decides which fields a finding must state.
+  const other = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [answer('fail', [{ ...ARC_FINDING, consequence: '', impact: 'a real impact' }])],
+  })
+  const otherPayload = payloadOf((await other.invoke('mode=arc')).text)
+  assert.equal(otherPayload.findings.length, 0)
+  assert.ok(otherPayload.withheld[0].reason.includes('"consequence"'), otherPayload.withheld[0].reason)
+}
+
+// 76 — evidence is required in every mode: a mode that leaves it out of its
+// field list still gets it, and a finding without it is never published.
+{
+  await withSettings({
+    modes: {
+      spell: {
+        label: 'Spelling review',
+        systemPrompt: 'You review spelling and nothing else.',
+        fields: [{ key: 'correction', label: 'Correction' }],
+        severities: [{ id: 'typo', label: 'typo', tone: 'muted', verdict: 'warn' }],
+      },
+    },
+  }, async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      script: [answer('warn', [{
+        severity: 'typo', category: 'spelling', file: 'internal/chessx/board.go',
+        title: 'Misspelled word', problem: 'boardu is not a word', correction: 'boardu → board', evidence: '',
+      }])],
+    })
+    const result = await h.invoke('mode=spell')
+    const payload = payloadOf(result.text)
+    assert.deepEqual(
+      payload.mode.fields.map(field => field.key),
+      ['correction', 'evidence'],
+      'the declared field stands, and evidence is appended because it was left out',
+    )
+    assert.equal(payload.findings.length, 0, 'a claim with no quote is not published')
+    assert.equal(payload.withheld[0].reason, 'no evidence quoted')
+    assert.ok(h.seen.prompts[0].system.includes('"evidence"'), 'and the contract asks for the quote')
+  })
+}
+
+// 77 — a mode that does not exist is refused, with the modes that do, and no
+// model call is spent finding out.
+{
+  const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+  const result = await h.invoke('mode=nope')
+  assert.equal(result.kind, 'error')
+  assert.ok(result.text.includes('unknown mode "nope"'), result.text)
+  assert.ok(result.text.includes('cr (Code review)'), 'the available modes are named')
+  assert.ok(result.text.includes('arc (Architecture review)'))
+  assert.equal(h.seen.prompts.length, 0, 'no reviewer call is made for a mode that does not resolve')
+}
+
+// 78 — a mode answers to its aliases, in any case.
+{
+  for (const typed of ['mode=architect', 'mode=architecture', 'mode=ARC', 'mode=Arc']) {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    const payload = payloadOf((await h.invoke(typed)).text)
+    assert.equal(payload.mode.id, 'arc', `${typed} resolves to arc`)
+  }
+  const aliased = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+  assert.equal(payloadOf((await aliased.invoke('mode=codereview')).text).mode.id, 'cr', 'and cr has aliases too')
+}
+
+// 79 — a mode the user wrote: its prompt, its fields, its severities and its own
+// settings, with no other focus area in the contract it is given.
+{
+  await withSettings({
+    modes: {
+      misspell: {
+        label: 'Spelling review',
+        aliases: ['spell'],
+        description: 'Reports misspellings in user-visible strings only.',
+        systemPrompt: 'You review the spelling, grammar and copy of user-visible strings, and nothing else.',
+        task: 'Report only misspellings. Do not report anything else you notice, however serious.',
+        categories: ['spelling', 'copy'],
+        fields: [
+          { key: 'problem', label: '', required: true, block: false, guide: 'the wrong word and what it should be' },
+          { key: 'correction', label: 'Correction', required: true, block: false, guide: 'the corrected text verbatim' },
+        ],
+        severities: [{ id: 'typo', label: 'typo', tone: 'muted', verdict: 'warn', meaning: 'a misspelled word in text a user reads' }],
+        verdicts: { pass: 'clean', warn: 'typos', fail: 'readable but wrong' },
+        settings: { language: 'tr', maxToolCalls: 7 },
+      },
+    },
+  }, async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      script: [
+        { toolCalls: [{ name: 'read_file', arguments: JSON.stringify({ path: READ_ONLY_FILE }) }] },
+        answer('warn', [{
+          severity: 'typo', category: 'spelling', file: 'internal/chessx/board.go', line: 13,
+          title: 'boardu yazılmış', problem: 'boardu bir sözcük değil', correction: 'boardu → board', evidence: '+new',
+        }], 'Bir yazım hatası.'),
+      ],
+    })
+    const result = await h.invoke('mode=spell')
+    assert.equal(result.kind, 'success', result.text)
+    const request = h.seen.prompts[0]
+    assert.ok(request.system.startsWith('You review the spelling'), 'the mode persona leads the system prompt')
+    assert.ok(request.system.includes('"correction"'), 'its field is in the contract')
+    assert.ok(!request.system.includes('"impact"'), 'and no field it did not declare is')
+    assert.ok(request.system.includes('a misspelled word in text a user reads'), 'its severity defines itself')
+    assert.ok(request.system.includes('spelling, copy'), 'its categories are listed')
+    const prompt = request.messages[0].content[0].text
+    assert.ok(prompt.includes('## Mode task (Spelling review)'), 'the mode task is in the run prompt')
+    assert.ok(prompt.includes('Do not report anything else'), 'including what not to report')
+    assert.ok(prompt.includes('in "tr".'), 'the mode\'s own language setting decides the report language')
+    const footer = messagesOf(h.seen.prompts[1], 'tool')[0].content[0].text
+    assert.ok(footer.includes('1/7 calls'), 'and its own reader budget is in force')
+
+    const payload = payloadOf(result.text)
+    assert.equal(payload.mode.id, 'misspell', 'the alias resolved to the mode id')
+    assert.equal(payload.mode.label, 'Spelling review')
+    assert.equal(payload.mode.promptFrom, 'file')
+    assert.deepEqual(payload.mode.severities.map(severity => severity.id), ['typo'], 'one severity, no room to inflate')
+    assert.equal(payload.findings.length, 1)
+    assert.equal(payload.findings[0].correction, 'boardu → board')
+    assert.ok(result.text.includes('## Spelling review — typos'), 'the report uses the mode\'s verdict word')
+    assert.ok(result.text.includes('(typo 1)'), 'and its severity label')
+    assert.ok(!result.text.includes('**Impact:**'), 'a field the mode does not declare is not rendered')
+  })
+}
+
+// 80 — what the file states wins over what this release ships, and the contract
+// is appended to it either way.
+{
+  await withSettings({ modes: { cr: { systemPrompt: 'You are the hand-written reviewer.' } } }, async () => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    const result = await h.invoke('')
+    const system = h.seen.prompts[0].system
+    assert.ok(system.startsWith('You are the hand-written reviewer.'), 'the file\'s persona is the one sent')
+    assert.ok(!system.includes('senior code reviewer'), 'the release persona is not sent as well')
+    assert.ok(system.includes('## Evidence bar'), 'and the contract still follows it')
+    const payload = payloadOf(result.text)
+    assert.equal(payload.mode.promptFrom, 'file', 'the report says where the prompt came from')
+    assert.ok(result.text.includes('prompt: config.json'), 'so a user can tell their edit is in force')
+    assert.deepEqual(
+      payload.mode.fields.map(field => field.key),
+      ['problem', 'impact', 'trigger', 'suggestion', 'evidence'],
+      'the keys the file left alone still come from the release',
+    )
+  })
+}
+
+// 81 — the file is completed, never rewritten: a release mode comes back whole,
+// a mode of the user's own is left exactly as it is, and nothing is written twice.
+{
+  await withEmptyHome(async home => {
+    const file = settingsPath(home)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, `${JSON.stringify({ modes: { cr: { label: 'My review' }, mine: { label: 'Mine' } } }, null, 2)}\n`)
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false, script: [answer('pass', [], 'ok')] })
+    const payload = payloadOf((await h.invoke('')).text)
+    assert.equal(payload.mode.label, 'My review', 'the label the file states wins')
+    const doc = JSON.parse(readFileSync(file, 'utf8'))
+    assert.ok(doc.modes.cr.systemPrompt.includes('senior code reviewer'), 'a deleted key comes back with its default')
+    assert.equal(doc.mode, 'cr', 'a setting the file never had is added')
+    assert.equal(doc.provider, '', 'with the release default')
+    assert.deepEqual(Object.keys(doc.modes.mine), ['label'], 'a mode of the user\'s own is never extended')
+    assert.equal(doc.modes.arc.settings.maxToolCalls, 60, 'the architecture preset is in the file, where it can be changed')
+    const after = readFileSync(file, 'utf8')
+    const again = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false, script: [answer('pass', [], 'ok')] })
+    await again.invoke('')
+    assert.equal(readFileSync(file, 'utf8'), after, 'a file with nothing missing is not written to at all')
+  })
+}
+
+// 82 — a disabled mode is not offered, and a disabled default falls back loudly
+// rather than leaving `/review` unusable.
+{
+  await withSettings({ modes: { arc: { enabled: false } } }, async () => {
+    const refused = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+    const result = await refused.invoke('mode=arc')
+    assert.equal(result.kind, 'error')
+    assert.ok(result.text.includes('mode "arc" is disabled'), result.text)
+    assert.ok(!result.text.includes('arc (Architecture review)'), 'a disabled mode is not listed as available')
+    assert.equal(refused.seen.prompts.length, 0, 'and no reviewer call is made')
+  })
+
+  const { value, warnings } = await withSettings({ mode: 'arc', modes: { arc: { enabled: false } } }, async () => {
+    return captureWarnings(async () => {
+      const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+      return payloadOf((await h.invoke('')).text)
+    })
+  })
+  assert.equal(value.mode.id, 'cr', 'a bare /review still runs the default mode')
+  assert.ok(warnings.some(line => line.includes('is disabled')), warnings.join('\n'))
+
+  // A file that switches everything off has nothing to run, and says so rather
+  // than picking a mode the user took off the surface.
+  await withSettings({ modes: { cr: { enabled: false }, arc: { enabled: false } } }, async () => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+    const result = await h.invoke('')
+    assert.equal(result.kind, 'error')
+    assert.ok(result.text.includes('no mode is enabled'), result.text)
+    assert.equal(h.seen.prompts.length, 0)
+  })
+}
+
+// 83 — a mode's settings are a preset: they win over the file's own, and what is
+// typed after /review wins over both.
+{
+  await withSettings({
+    language: 'en',
+    maxToolCalls: 4,
+    modes: { cr: { settings: { language: 'tr' } } },
+  }, async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      script: [
+        { toolCalls: [{ name: 'read_file', arguments: JSON.stringify({ path: READ_ONLY_FILE }) }] },
+        answer('pass', [], 'ok'),
+      ],
+    })
+    await h.invoke('')
+    const prompt = h.seen.prompts[0].messages[0].content[0].text
+    assert.ok(prompt.includes('in "tr".'), 'the mode\'s setting beats the file\'s')
+    const footer = messagesOf(h.seen.prompts[1], 'tool')[0].content[0].text
+    assert.ok(footer.includes('1/4 calls'), 'and a setting the mode does not preset is the file\'s')
+
+    const typed = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    await typed.invoke('language=en')
+    assert.ok(
+      typed.seen.prompts[0].messages[0].content[0].text.includes('in "en".'),
+      'and the command line beats them both',
+    )
+  })
+}
+
+// 84 — a mode written wrong is reported and run with what is usable: junk keys,
+// reserved field names and settings a mode may not set are named, never obeyed.
+{
+  await withSettings({
+    modes: {
+      junk: {
+        label: 42,
+        aliases: 'junkish',
+        enabled: 'yes',
+        fields: [{ key: 'file' }, { key: 'problem', label: 'Problem' }, 'nope', {}, { key: 'problem' }],
+        severities: [{ id: 'weird', verdict: 'whatever', tone: 'rainbow' }, { id: '' }],
+        verdicts: 'nope',
+        settings: { notASetting: 1, mode: 'arc', ignored: ['vendor/'] },
+      },
+    },
+  }, async () => {
+    const { value, warnings } = await captureWarnings(async () => {
+      const h = harness({
+        summary: SUMMARY,
+        diffs: [TEXT_DIFF, BINARY_DIFF],
+        script: [answer('warn', [{
+          severity: 'weird', category: 'general', file: 'internal/chessx/board.go',
+          title: 'T', problem: 'p', evidence: '+new',
+        }])],
+      })
+      return { payload: payloadOf((await h.invoke('mode=junkish')).text), system: h.seen.prompts[0].system }
+    })
+    assert.equal(value.payload.mode.id, 'junk')
+    assert.equal(value.payload.mode.label, 'junk', 'a label that is not a string falls back to the id')
+    assert.deepEqual(
+      value.payload.mode.fields.map(field => field.key),
+      ['problem', 'evidence'],
+      'a reserved key, a duplicate and the junk entries are dropped',
+    )
+    assert.deepEqual(value.payload.mode.severities, [{ id: 'weird', label: 'weird', tone: 'warn' }], 'unknown values fall back safely')
+    assert.equal(value.payload.findings.length, 1, 'and the run still produces a checked finding')
+    assert.ok(value.system.includes('"problem"'), 'the contract lists what survived')
+    assert.ok(warnings.some(line => line.includes('part of the finding structure')), warnings.join('\n'))
+    assert.ok(warnings.some(line => line.includes('is not a setting this plugin reads')), warnings.join('\n'))
+    assert.ok(warnings.some(line => line.includes('cannot be set by a mode')), warnings.join('\n'))
+    assert.ok(warnings.some(line => line.includes('declared twice')), warnings.join('\n'))
+    // The one thing a severity table may not do quietly: claim a verdict or a
+    // tone that does not exist. Both are named and the usable part runs.
+    assert.ok(warnings.some(line => line.includes('verdict "whatever"')), warnings.join('\n'))
+    assert.ok(warnings.some(line => line.includes('tone "rainbow"')), warnings.join('\n'))
+  })
+}
+
+// 85 — the card draws whatever mode the payload describes, and still cannot
+// send anything.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [answer('fail', [ARC_FINDING], 'The reset belongs to the caller.')],
+  })
+  const result = await h.invoke('mode=arc')
+  const card = await renderCard({ kind: 'success', text: result.text })
+  assert.ok(card.texts.includes('Architecture review'), 'the card is titled by the mode')
+  assert.ok(card.texts.includes('decide before merge'), 'the chip is the mode\'s word for the verdict')
+  assert.ok(card.texts.includes('high'), 'the severity chip is the mode\'s severity')
+  assert.ok(card.texts.includes(`Consequence: ${ARC_FINDING.consequence}`), 'its fields are labelled by it')
+  assert.ok(card.texts.includes(`Alternative: ${ARC_FINDING.alternative}`))
+  assert.ok(card.texts.includes('Evidence'), 'and the evidence is quoted')
+  assert.ok(!card.texts.includes('Impact'), 'a field arc does not declare is not drawn')
+  assert.deepEqual(
+    card.buttons,
+    ['action.copyReport', 'toggle.hide', 'action.copyFinding'],
+    'a mode changes what the card says, never what it can do',
+  )
+
+  // The same card path, on the mode that ships as the default: the vocabulary
+  // travels in the payload, so the card needs no branch for either of them. The
+  // long fields are asserted through the copy, which is the same renderer the
+  // report uses.
+  const cr = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('fail', [PROVEN], 'Nil board.')] })
+  const crText = (await cr.invoke('')).text
+  const crCard = await renderCard({ kind: 'success', text: crText })
+  assert.ok(crCard.texts.includes('Code review'), 'the default mode titles its card from the payload')
+  assert.ok(crCard.texts.includes('blocker'), 'with the severity the mode named')
+  assert.ok(crCard.texts.includes('Guard the nil board'), 'and the finding it produced')
+  assert.ok(crCard.texts.includes('Fix: return early'), 'and its own field labels')
+  const api = await loadClientApi()
+  const crPayload = api.__test.parsePayload(crText)
+  const pasted = api.__test.findingText(crPayload.findings[0], 0, api.__test.modeOf(crPayload))
+  assert.ok(pasted.includes(`**How it is reached:** ${PROVEN.trigger}`), 'and the copy carries every field it declared')
+  assert.ok(pasted.includes(`**Impact:** ${PROVEN.impact}`), 'in the mode\'s own order and wording')
+}
+
+// 86 — the file decides which mode a bare /review runs, and the command line
+// still overrides it.
+{
+  await withSettings({ mode: 'arc' }, async () => {
+    const bare = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    assert.equal(payloadOf((await bare.invoke('')).text).mode.id, 'arc', 'the configured mode runs')
+    const typed = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    assert.equal(payloadOf((await typed.invoke('mode=cr')).text).mode.id, 'cr', 'and a typed mode wins')
+  })
+}
+
+// 87 — a mode with no persona is still a working mode: the contract alone is the
+// system prompt, and the minimum field set is what a finding must state.
+{
+  await withSettings({ modes: { bare: { systemPrompt: '', task: '', fields: [] } } }, async () => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    const result = await h.invoke('mode=bare')
+    const system = h.seen.prompts[0].system
+    assert.ok(system.startsWith('## Reading the project'), 'the contract is the whole system prompt')
+    assert.ok(system.includes('## Evidence bar'), 'with the gate in it')
+    assert.ok(system.includes('"evidence"'), 'and the quote the gate checks')
+    assert.ok(!system.includes('senior code reviewer'), 'and no other mode\'s persona')
+    const payload = payloadOf(result.text)
+    assert.deepEqual(
+      payload.mode.fields.map(field => field.key),
+      ['problem', 'evidence'],
+      'a mode that declares no field gets the minimum every mode states',
+    )
+    assert.equal(payload.mode.promptFrom, 'file')
+  })
+}
+
+// 88 — a severity table is read by weight, not by position: a mode that lists its
+// severities strongest-last still lowers an undeclared one to the weakest, and a
+// substitution never raises the verdict.
+{
+  await withSettings({
+    modes: {
+      upside: {
+        label: 'Upside down',
+        systemPrompt: 'You review one change set.',
+        fields: [{ key: 'problem', label: '' }, { key: 'evidence', label: 'Evidence', block: true }],
+        severities: [
+          { id: 'low', label: 'low', tone: 'muted', verdict: 'pass' },
+          { id: 'high', label: 'high', tone: 'error', verdict: 'fail' },
+        ],
+      },
+    },
+  }, async () => {
+    const { value: payload, warnings } = await captureWarnings(async () => {
+      const h = harness({
+        summary: SUMMARY,
+        diffs: [TEXT_DIFF, BINARY_DIFF],
+        script: [answer('fail', [{
+          severity: 'catastrophic', category: 'general', file: 'internal/chessx/board.go',
+          title: 'Nothing declares this', problem: 'p', evidence: '+new',
+        }])],
+      })
+      return payloadOf((await h.invoke('mode=upside')).text)
+    })
+    assert.equal(payload.findings.length, 1, 'the finding is still gated on its own merits')
+    assert.equal(
+      payload.findings[0].severity,
+      'low',
+      'the entry that claims least, not the last one the file happens to list',
+    )
+    assert.equal(payload.verdict, 'pass', 'a substitution claims the least it can, so it cannot raise the verdict')
+    assert.ok(warnings.some(line => line.includes('catastrophic')), warnings.join('\n'))
+  })
+
+  // The table a release ships is written weakest-last, so the fallback lands
+  // where it always did: cr's undeclared severity is still a nit.
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [answer('warn', [{ ...PROVEN, severity: 'severe' }])],
+  })
+  const payload = payloadOf((await h.invoke('')).text)
+  assert.equal(payload.findings[0].severity, 'nit', 'the weakest end of the default table is unchanged')
+  assert.equal(payload.verdict, 'warn', 'and it still lands as a warning, never as a failure')
 }
 
 console.log('selftest: all checks passed')
