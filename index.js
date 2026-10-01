@@ -8,6 +8,15 @@
  * the Agent is told about it only when `notifyAgent` is set to `steer` or
  * `inject`. Nothing is ever written to the workspace.
  *
+ * The reviewer records the review with its own tools — `append_finding`,
+ * `update_finding`, `delete_finding`, `list_findings`, `set_summary` and
+ * `finish_review` — and the report is assembled from what they stored, never
+ * from the model's prose. Those six are the protocol: no setting, no mode and no
+ * command line adds, removes or renames one, and a run that stops early keeps
+ * every finding already recorded. A failed call, a spent budget, a cancel or a
+ * model that never finishes therefore yields a partial report marked as such
+ * instead of nothing at all. See `reviewToolsFor` and `createFindingStore`.
+ *
  * A mode is a role: its persona prompt, its task, the fields one finding states,
  * the severity vocabulary that decides the verdict, and a preset of run settings.
  * Two are built in — `cr` (code review, the default) and `arc` (architecture
@@ -15,8 +24,9 @@
  * defaults live in this module; the settings file is kept complete by an
  * additive sync, and whatever the file states wins. What a mode can never change
  * is the evidence gate: every finding quotes its proof verbatim and is checked
- * mechanically against the diff and what the reader tools returned. See
- * `BUILT_IN_MODES`, `renderContract` and `verifyFindings`.
+ * mechanically against the diff and what the reader tools returned, when it is
+ * recorded and again when the report is built. See `BUILT_IN_MODES`,
+ * `renderContract` and `gateReason`.
  *
  * Settings: DSH_HOME/code-review/config.json — created with the defaults when it
  * is missing, missing keys added on load, re-read on every run.
@@ -43,21 +53,101 @@ const MARKER = '<!-- code-review:payload -->'
 /** The mode `/review` runs when neither the command line nor the file names one. */
 const DEFAULT_MODE_ID = 'cr'
 
-/** Finding keys a mode may not declare as a narrative field: the structure, not the prose. */
-const RESERVED_FIELD_KEYS = new Set(['severity', 'category', 'file', 'line', 'title', 'summary'])
+/**
+ * The structure of a finding: the keys every finding carries besides the fields
+ * the mode declares, in the order a finding states them. One table holds each of
+ * them once, and everything that needs them is derived from it — the skeleton
+ * the store starts a finding from, the keys a call may name, the keys a mode may
+ * not declare as its own fields, the parameters the model is offered, and how a
+ * call's value becomes the value the finding holds. A key added here therefore
+ * exists in all of them at once, instead of in as many places as there are lists.
+ *
+ * `blank` is what a finding that does not answer the key holds; `required` is
+ * whether the model must send it at all (a finding that cannot be published is
+ * recorded as withheld either way); `read` turns what a call sent into the value
+ * a finding holds; `reject` says why a value cannot be used, or nothing when it
+ * can; `named` marks the keys the report and the withheld list name a finding
+ * by; `property` describes the key to the model in the mode's own vocabulary.
+ */
+const FINDING_FIELDS = [
+  {
+    key: 'severity',
+    required: true,
+    blank: '',
+    named: true,
+    read: value => String(value).trim(),
+    reject: (value, mode) => {
+      const severity = typeof value === 'string' ? value.trim() : ''
+      if (severity === '') return '"severity" must be a non-empty string'
+      return mode.severities.some(entry => entry.id === severity)
+        ? undefined
+        : `"${severity}" is not a severity of mode "${mode.id}" — use one of: ${mode.severities.map(entry => entry.id).join(', ')}`
+    },
+    property: mode => {
+      const ids = mode.severities.map(entry => entry.id)
+      return { type: 'string', enum: ids, description: `the severity this finding claims — one of: ${ids.join(', ')}` }
+    },
+  },
+  {
+    key: 'category',
+    required: false,
+    blank: '',
+    read: value => String(value).trim(),
+    reject: value => (typeof value === 'string' ? undefined : '"category" must be a string'),
+    property: mode => ({
+      type: 'string',
+      description: mode.categories.length === 0
+        ? 'a short category for this finding'
+        : `the category this finding belongs to — one of: ${mode.categories.join(', ')}`,
+    }),
+  },
+  {
+    key: 'file',
+    required: true,
+    blank: '',
+    named: true,
+    read: value => String(value).trim(),
+    reject: value => (typeof value === 'string' ? undefined : '"file" must be a string'),
+    property: () => ({ type: 'string', description: 'the path exactly as the diff names it' }),
+  },
+  {
+    key: 'line',
+    required: false,
+    blank: null,
+    named: true,
+    read: value => (Number.isInteger(value) && value > 0 ? value : null),
+    reject: value => (value === null || (Number.isInteger(value) && value > 0)
+      ? undefined
+      : `"line" must be a whole line number of the new file, or omitted (got ${JSON.stringify(value)})`),
+    property: () => ({ type: 'integer', description: 'the line the diff shows for the new file; omit it when no single line applies' }),
+  },
+  {
+    key: 'title',
+    required: true,
+    blank: '',
+    named: true,
+    read: value => String(value).trim(),
+    reject: value => (typeof value === 'string' ? undefined : '"title" must be a string'),
+    property: () => ({ type: 'string', description: 'a short, specific, imperative name for this finding' }),
+  },
+]
+
+/** The structural keys of a finding, in the order the store writes them. */
+const FINDING_KEYS = FINDING_FIELDS.map(field => field.key)
+
+/**
+ * Finding keys a mode may not declare as a narrative field: the structure of a
+ * finding, not its prose, plus `summary` (the report's opening) and `id` (the
+ * handle the store assigns and the reviewer addresses through `update_finding`
+ * and `delete_finding`).
+ */
+const RESERVED_FIELD_KEYS = new Set([...FINDING_KEYS, 'summary', 'id'])
 
 /** Chip tones the Client knows how to draw. */
 const TONES = new Set(['error', 'warn', 'success', 'muted'])
 
-/**
- * How much each verdict claims. The ranking is what lets a severity table be
- * read without trusting the order the file happens to list it in: a substitution
- * or a fallback picks the entry that claims least.
- */
-const VERDICT_WEIGHT = { pass: 0, warn: 1, fail: 2 }
-
 /** Verdicts a severity may force on a run. */
-const VERDICTS = new Set(Object.keys(VERDICT_WEIGHT))
+const VERDICTS = new Set(['pass', 'warn', 'fail'])
 
 /** A unified-diff hunk header, capturing its old-side and new-side line counts. */
 const HUNK_HEADER = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/
@@ -119,6 +209,21 @@ export const DEFAULTS = {
 
 /** Output cap for the one retry after a provider rejects the configured one. */
 const FALLBACK_MAX_TOKENS = 8192
+
+/**
+ * The bounds of one review run. They are the plugin's own, deliberately not
+ * settings: the review tools are the protocol, so nothing a user configures may
+ * shrink them to where a review cannot be recorded — and nothing may grow them
+ * into a run that never ends.
+ *
+ * `MAX_STORE_CALLS` bounds the calls that change the review. The calls that
+ * inspect the store, describe it and close it are not counted against it, so a
+ * run that reached the cap can still finish and say what it holds.
+ */
+const MAX_FINDINGS = 100
+const MAX_STORE_CALLS = 300
+const MAX_STEPS = 150
+const MAX_NUDGES = 2
 
 /**
  * What a review is never useful on: dependency trees, build output, generated
@@ -705,13 +810,38 @@ function resolveMode(settings, overrides, log) {
   return { mode: fallback }
 }
 
+/** How the contract opens when the run was given the read-only project tools. */
+const READING_SECTION = `## Reading the project
+
+You have three read-only tools: read_file, list_dir and search. They are the only way you touch the workspace, and they cannot change anything or run anything — there is no command execution, no write, and no network. Paths the review excluded as ignored — dependency trees, build output, caches — are outside the project as far as you are concerned: they are not in the diff, the tools refuse them, and nothing found in them is a finding.
+
+Use them to settle a specific question, not to explore:
+- Before recording a finding that depends on code outside the diff — a caller's arguments, a function's contract, a type's definition, whether a guard already exists upstream — read that code and confirm it. A suspicion you did not check is not a finding.
+- Also read when the diff alone is genuinely ambiguous about what the change does.
+- Do not tour the repository, do not read files unrelated to the change, and do not read a file twice to look for more. The budget is small and it is shown to you as it shrinks.
+- Reading is for verification, never for finding extra work to report. Anything you notice outside the change set is out of scope unless this diff makes it reachable or worse.`
+
 /**
- * What every mode is told, whatever its persona says: the tools, the evidence
- * bar, the fields a finding must state, the severity table, the categories and
- * the exact JSON shape. Appended to the mode's own prompt and not writable by
- * it, because these are the rules the run is verified against.
+ * How the contract opens when it was not. A persona is free to mention reading
+ * the workspace — the built-in ones do — so this section states the truth about
+ * this run and is the last word on it: not why the run cannot read, which is the
+ * run's own bookkeeping, only that it cannot.
  */
-function renderContract(mode) {
+const NO_READING_SECTION = `## Reading the project
+
+This run cannot read the project: there is no read_file, no list_dir and no search here, and this section replaces every other mention of reading the workspace, including any in your role above. Decide from the diff alone. A finding that depends on a caller, a definition, a guard or any other file you cannot see does not meet the evidence bar here — leave it out rather than assuming what it says.`
+
+/**
+ * What every mode is told, whatever its persona says: the review tools it
+ * records the findings with, the evidence bar, the fields a finding must state,
+ * the severity table, the categories and the reading rules of this run. Appended
+ * to the mode's own prompt and not writable by it, because these are the rules
+ * the run is verified against.
+ *
+ * The six tools are named here and offered on every call of the run; a mode
+ * decides the vocabulary they carry, never whether they exist.
+ */
+function renderContract(mode, { reader }) {
   const fields = mode.fields
     .map(field => `- "${field.key}" (${field.label === '' ? field.key : field.label})${field.required ? ' — required' : ' — optional'}${field.guide === '' ? '' : `: ${field.guide}`}`)
     .join('\n')
@@ -721,21 +851,13 @@ function renderContract(mode) {
   const categories = mode.categories.length === 0
     ? ''
     : `\n## Categories\n\n${mode.categories.join(', ')}\n`
-  return `## Reading the project
-
-You have three read-only tools: read_file, list_dir and search. They are the only way you touch the workspace, and they cannot change anything or run anything — there is no command execution, no write, and no network. Paths the review excluded as ignored — dependency trees, build output, caches — are outside the project as far as you are concerned: they are not in the diff, the tools refuse them, and nothing found in them is a finding.
-
-Use them to settle a specific question, not to explore:
-- Before reporting a finding that depends on code outside the diff — a caller's arguments, a function's contract, a type's definition, whether a guard already exists upstream — read that code and confirm it. A suspicion you did not check is not a finding.
-- Also read when the diff alone is genuinely ambiguous about what the change does.
-- Do not tour the repository, do not read files unrelated to the change, and do not read a file twice to look for more. The budget is small and it is shown to you as it shrinks.
-- Reading is for verification, never for finding extra work to report. Anything you notice outside the change set is out of scope unless this diff makes it reachable or worse.
+  return `${reader ? READING_SECTION : NO_READING_SECTION}
 
 ## Evidence bar — this is the whole job
 
 - Every finding MUST quote, in "evidence", the exact line or lines that prove it, copied verbatim: a diff line including its leading "+", "-" or space, or a line from a file you actually read.
-- Every quoted line is checked mechanically against the diff and against everything the tools returned to you. A quote that does not occur there is discarded together with its finding.
-- If you cannot quote such lines, you do not have a finding. Drop it completely: do not report it, do not hint at it, do not mention it in your summary, do not downgrade it into a "consider" note.
+- Every quoted line is checked mechanically against the diff and against everything the tools returned to you — when you record the finding and again when the report is built. A quote that does not occur there is recorded as withheld and never published, so copy the line rather than typing it from memory.
+- If you cannot quote such lines, you do not have a finding. Drop it completely: do not record it, do not hint at it, do not mention it in your summary, do not downgrade it into a "consider" note.
 - Reachability counts. A problem that requires an input, state or call path that the code shows to be impossible is not a finding.
 - Pre-existing code is not yours to review. Report a pre-existing problem only when this diff makes it reachable or worse, and say which changed line does that.
 
@@ -743,7 +865,7 @@ Use them to settle a specific question, not to explore:
 
 ${fields}
 
-Every field marked required must be answered in the finding's own words, at the depth its guide asks for. A finding that cannot answer one of them is withheld and never published.
+Every field marked required must be answered in the finding's own words, at the depth its guide asks for. A finding that cannot answer one of them is recorded as withheld and never published.
 
 ## Severity
 
@@ -751,40 +873,32 @@ ${severities}
 
 Never inflate a severity: you will be held to it. If you hesitate between two severities, choose the lower one. A matter of taste is not the lowest severity; it is not a finding at all.
 ${categories}
-## Output
+## Recording the review
 
-Output exactly one JSON object, with no prose and no code fence:
-${jsonTemplate(mode)}
+Your review is the findings you record with the review tools. Nothing you write in your own answer reaches the report: the report is built from the store the moment you call finish_review. The tools are:
 
-The verdict is recomputed from the severities of the findings that survive, so never state a verdict the findings do not support. "summary" says what the change set does and whether it holds up, and it mentions only what you kept.
+- append_finding — record one finding as soon as it is settled rather than holding it until the end. A run that stops early keeps everything already recorded, and nothing else. severity is one of the ids in the table above; file, line and title name the finding; every field listed above is a string.
+- update_finding — change a finding already recorded, by the id append_finding returned: a quote, a field, a severity, a title. Send only what changes.
+- delete_finding — drop a finding a later look invalidated, so the report never carries a claim you no longer stand behind.
+- list_findings — every finding recorded so far, with its id and whether the evidence gate can publish it.
+- set_summary — record the 2-4 factual sentences that open the report: what the change set does and whether it holds up, mentioning only what you kept.
+- finish_review — end the review and build the report from the store. Recording nothing and finishing is a complete, respectable review when there is nothing to report.
 
-## Self-check before you answer
+A call the store refuses changes nothing and answers with what was wrong with it: fix the call and make it again. A finding the gate cannot publish is still recorded — as withheld, with its reason returned to you — so nothing you record is ever lost, and a withheld finding never carries the verdict.
 
-Re-read your own findings and delete every one that fails any of these: (a) it carries a verbatim quote that occurs in the diff or in something the tools returned; (b) everything it depends on has been read and confirmed, not assumed; (c) the path or the consequence it describes is reachable per what you read, and you can describe it; (d) every required field is answered in concrete terms; (e) it is the kind of problem this mode is here to find, not a matter of taste; (f) it is worth an expert author's attention. Then re-check that your summary describes only what you kept.`
+## Before you finish
+
+Call list_findings and delete every finding that fails any of these: (a) it carries a verbatim quote that occurs in the diff or in something the tools returned; (b) everything it depends on has been read and confirmed, not assumed; (c) the path or the consequence it describes is reachable per what you read, and you can describe it; (d) every required field is answered in concrete terms; (e) it is the kind of problem this mode is here to find, not a matter of taste; (f) it is worth an expert author's attention. Then record the summary with set_summary, re-check that it describes only what you kept, and call finish_review.`
 }
 
-/** The JSON object the mode's reviewer must return, built from the mode's own vocabulary. */
-function jsonTemplate(mode) {
-  const severity = mode.severities.map(entry => entry.id).join('"|"')
-  const category = mode.categories.length === 0 ? '<one category>' : mode.categories.join('|')
-  const members = [
-    `"severity":"${severity}"`,
-    `"category":"${category}"`,
-    '"file":"<path exactly as the diff names it>"',
-    '"line":<number the diff shows for the new file, or null>',
-    '"title":"<short, specific, imperative>"',
-    ...mode.fields.map(field => `"${field.key}":"${
-      field.block
-        ? '<verbatim line(s) proving it — from the diff or from a file you read — each on its own line>'
-        : `<${field.key}>`
-    }"`),
-  ]
-  return `{"verdict":"fail"|"warn"|"pass","summary":"<2-4 factual sentences: what the change set does and whether it holds up>","findings":[{${members.join(',')}}]}`
-}
-
-/** The system prompt of one run: the mode's own persona, then the contract it cannot change. */
-function systemPromptFor(mode) {
-  const contract = renderContract(mode)
+/**
+ * The system prompt of one run: the mode's own persona, then the contract it
+ * cannot change. `options.reader` is whether the run may read the project — the
+ * same answer `readerStop` gives for the tools it is offered, so the contract
+ * and the tool list can never describe two different runs.
+ */
+function systemPromptFor(mode, options) {
+  const contract = renderContract(mode, options)
   return mode.systemPrompt === '' ? contract : `${mode.systemPrompt}\n\n${contract}`
 }
 
@@ -1818,9 +1932,14 @@ async function collectGitChanges(ctx, cwd, settings, base, scope, touchedFor, si
 }
 
 // The reader tools answer under the same ignore rules as the diff: a path the
-// review excluded cannot be listed, searched or read back in. `DEFAULT_IGNORE`
-// holds the built-in directories that used to be listed here.
-const READER_TOOLS = [
+// review excluded cannot be listed, searched or read back in.
+//
+// One table holds each reader tool once — the name the run offers, the
+// definition the model is shown, and the arm that runs a call. The offer, the
+// acceptance and the execution therefore come from the same entry, so a name
+// cannot be offered and refused, or accepted and never run: a name this table
+// does not hold is an unknown tool, not another tool's call.
+const READER_TOOL_SPECS = [
   {
     name: 'read_file',
     description: 'Read a UTF-8 text file from the workspace. The reply starts with a header naming the path and the line range; the content follows without line-number prefixes. Read only what settles a specific question. A path the review excludes as ignored — a dependency tree, build output, a cache — is refused.',
@@ -1834,6 +1953,7 @@ const READER_TOOLS = [
       required: ['path'],
       additionalProperties: false,
     },
+    run: (args, { root, budget, ignore }) => readFileTool(args, root, budget, ignore),
   },
   {
     name: 'list_dir',
@@ -1844,6 +1964,7 @@ const READER_TOOLS = [
       required: [],
       additionalProperties: false,
     },
+    run: (args, { root, budget, signal, ignore }) => listDirTool(args, root, budget, signal, ignore),
   },
   {
     name: 'search',
@@ -1857,8 +1978,15 @@ const READER_TOOLS = [
       required: ['query'],
       additionalProperties: false,
     },
+    run: (args, { root, budget, signal, settings, ignore }) => searchTool(args, root, budget, signal, settings.maxSearchResults, ignore),
   },
 ]
+
+/** The reader definitions the model is offered, in the order they are offered. */
+const READER_TOOLS = READER_TOOL_SPECS.map(({ name, description, parameters }) => ({ name, description, parameters }))
+
+/** The reader tool a call names, or undefined when this run has no such tool. */
+const READER_TOOL_BY_NAME = new Map(READER_TOOL_SPECS.map(tool => [tool.name, tool]))
 
 function relativePath(root, target) {
   const rel = relative(root, target)
@@ -1914,9 +2042,8 @@ function readFileTool(args, root, budget, ignore) {
   if (stat.isDirectory()) return { text: `${args.path} is a directory — use list_dir`, isError: true }
   if (!stat.isFile()) return { text: `${args.path} is not a regular file`, isError: true }
   if (stat.size > 1_000_000) return { text: `${args.path} is ${stat.size} bytes; too large to read`, isError: true }
-  if (budget.bytes >= budget.maxBytes) {
-    return { text: `reader budget spent (${budget.bytes}/${budget.maxBytes} bytes); answer with what you have`, isError: true }
-  }
+  // The byte budget is `readerStop`'s to enforce, before this tool is reached;
+  // what is left of it only bounds how much of the file comes back.
   let content
   try {
     content = readFileSync(target, 'utf8')
@@ -2031,20 +2158,23 @@ function searchTool(args, root, budget, signal, maxSearchResults, ignore) {
   }
 }
 
-function runReaderTool(call, root, budget, signal, settings, ignore) {
-  let args
+/**
+ * One tool call's arguments as a JSON object, or the refusal that says why they
+ * are unusable. A call with no arguments at all is the empty object, which is
+ * what the tools that take none receive.
+ */
+function parseToolArguments(call) {
+  if (call.arguments.trim() === '') return { value: {} }
+  let parsed
   try {
-    args = call.arguments.trim() === '' ? {} : JSON.parse(call.arguments)
+    parsed = JSON.parse(call.arguments)
   } catch (error) {
-    return { text: `cannot parse arguments for ${call.name}: ${String(error)}`, isError: true }
+    return { failure: `refused: cannot parse arguments for ${call.name}: ${String(error)} — send one JSON object` }
   }
-  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-    return { text: `arguments for ${call.name} must be a JSON object`, isError: true }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { failure: `refused: arguments for ${call.name} must be a JSON object` }
   }
-  if (call.name === 'read_file') return readFileTool(args, root, budget, ignore)
-  if (call.name === 'list_dir') return listDirTool(args, root, budget, signal, ignore)
-  if (call.name === 'search') return searchTool(args, root, budget, signal, settings.maxSearchResults, ignore)
-  return { text: `unknown tool "${call.name}"; read_file, list_dir and search are the only tools available`, isError: true }
+  return { value: parsed }
 }
 
 /**
@@ -2100,141 +2230,357 @@ function summarizeCall(call) {
   } catch {
     args = {}
   }
-  const detail = args?.path ?? args?.query ?? ''
+  const detail = args?.path ?? args?.query ?? args?.id ?? ''
   return detail === '' ? call.name : `${call.name} ${clamp(String(detail), 60)}`
 }
 
 /**
- * Runs the reader loop and returns the answer plus the corpus the reviewer was shown.
+ * Why the read-only tools are not available right now, or undefined when they
+ * are. One place answers it — the tool list the model is offered, the dispatcher
+ * that runs a call and the refusal that names what a run still offers all read
+ * this answer — so a bound cannot be enforced in one of them and forgotten in
+ * another, and the tools are never offered while the budget guarantees a refusal.
+ */
+function readerStop({ readerAvailable, budget, settings, deadlineAt }) {
+  if (!readerAvailable) return 'project access is off for this run'
+  if (budget.calls >= settings.maxToolCalls) {
+    return `the reader budget is spent (${budget.calls}/${settings.maxToolCalls} calls)`
+  }
+  if (budget.bytes >= budget.maxBytes) {
+    return `the reader byte budget is spent (${budget.bytes}/${budget.maxBytes} bytes)`
+  }
+  return Date.now() >= deadlineAt ? 'reading time is up' : undefined
+}
+
+/**
+ * What each stop means, in the words the report, the card and the agent notice
+ * show. The run's bookkeeping works with the code; this table is the only place
+ * a reader-facing sentence for one is written.
+ */
+const STOP_SENTENCES = {
+  cancelled: () => 'the review was cancelled',
+  timeout: () => 'the review ran out of time',
+  'call-failed': stop => `the reviewer call failed: ${stop.detail}`,
+  'tool-failed': stop => `the review stopped: ${stop.detail}`,
+  'not-finished': () => 'the reviewer stopped without calling finish_review',
+  'out-of-turns': () => `the reviewer kept working past this run's ${MAX_STEPS} model turns`,
+  'no-record': () => 'the reviewer stopped without recording anything',
+}
+
+/** The sentence one stop reads as. */
+function stopSentence(stop) {
+  return STOP_SENTENCES[stop.code](stop)
+}
+
+/**
+ * What the report says about a run that did not finish on its own terms: the stop
+ * it hit, and the store's cap when it had already closed before that. A review
+ * that closed after the cap is short for the same reason and says so.
+ */
+function incompleteNote(stop, store) {
+  const cap = `the store had already taken its ${MAX_STORE_CALLS} finding-tool calls`
+  if (stop.code === undefined) {
+    return store.capped === true
+      ? `the reviewer used its ${MAX_STORE_CALLS} finding-tool calls before it closed the review`
+      : undefined
+  }
+  const sentence = stopSentence(stop)
+  return store.capped === true ? `${sentence} — ${cap}` : sentence
+}
+
+/** The tool names one run offers, in the order it offers them, as of one call. */
+function offeredToolNames(tools, stop) {
+  return [
+    ...tools.map(tool => tool.name),
+    ...(stop === undefined ? READER_TOOLS.map(tool => tool.name) : []),
+  ]
+}
+
+/**
+ * Executes one tool call and returns its result.
+ *
+ * A review tool always runs: it is how the review exists at all, so no budget,
+ * no deadline and no setting withdraws it. A reader tool runs while `readerStop`
+ * says the run may read, and is refused with that reason otherwise — the
+ * reviewer is told what is left rather than waiting for a result that never
+ * comes. A name this run does not offer is refused with the list of the ones it
+ * does.
+ */
+function runTool(call, state) {
+  const { tools, store, root, budget, signal, settings, ignore, deadlineAt, readerAvailable, corpus, files, log } = state
+  const parsed = parseToolArguments(call)
+  if (parsed.failure !== undefined) return { kind: 'refused', result: { text: parsed.failure, isError: true } }
+  if (REVIEW_TOOL_NAMES.has(call.name)) {
+    return { kind: 'review', result: store.run(call.name, parsed.value) }
+  }
+  const reader = READER_TOOL_BY_NAME.get(call.name)
+  const stop = readerStop(state)
+  if (reader === undefined) {
+    // A name this run does not have, whatever it resembles: refused with the
+    // list of the ones it does, never quietly run as another tool.
+    return {
+      kind: 'refused',
+      result: {
+        text: `refused: unknown tool "${call.name}" — this run offers: ${offeredToolNames(tools, stop).join(', ')}`,
+        isError: true,
+      },
+    }
+  }
+  if (stop !== undefined) {
+    log.info(`${summarizeCall(call)} → refused (${stop})`)
+    return {
+      kind: 'refused',
+      result: {
+        text: readerAvailable
+          ? `refused: ${stop} — the read-only tools are not available; record your findings with the review tools and call finish_review`
+          : `refused: ${call.name} is not available in this run (${stop}) — this run offers: ${offeredToolNames(tools, stop).join(', ')}`,
+        isError: true,
+      },
+    }
+  }
+
+  budget.calls += 1
+  const result = reader.run(parsed.value, { root, budget, signal, settings, ignore })
+  // Only what a tool actually returned is evidence: a refusal is not a line of
+  // code, and a directory listing shows names, not contents.
+  if (result.isError !== true && (call.name === 'read_file' || call.name === 'search')) {
+    corpus.addText(result.text)
+    corpus.addLines(result.extraLines ?? [])
+  }
+  if (typeof result.file === 'string') {
+    files.add(result.file)
+    corpus.addPaths([result.file])
+  }
+  for (const file of result.files ?? []) files.add(file)
+  corpus.addPaths(result.files ?? [])
+  log.info(`reader ${budget.calls}/${settings.maxToolCalls}: ${summarizeCall(call)} → ${result.isError === true ? 'refused' : 'ok'}`)
+  return { kind: 'reader', result }
+}
+
+/**
+ * Runs one review to its end and returns what the report is built from.
+ *
+ * The reviewer records the findings with the review tools and the report is
+ * assembled from what they stored — never from the model's own text. Nothing
+ * recorded is lost: a call that fails, a budget that runs out, a cancel or a
+ * model that never calls finish_review all end the loop with whatever the store
+ * holds, marked incomplete when the review did not finish on its own terms.
  *
  * `policy` is the ignore policy the change set was collected under, passed in
  * whole rather than rebuilt here: a second policy assembled from the settings
  * alone would quietly drop the repository layer, and the files this very run
  * reported as excluded would be readable, searchable and citable again.
  *
- * `system` is the mode's persona plus its contract, and it is passed on every
- * call of the loop: the two of them belong to the run, not to one message.
+ * `diffs` and `paths` are the evidence the run starts with — the diffs it was
+ * shown and the files of the change set; whatever the reader tools return is
+ * added to that corpus as it arrives.
  */
-async function reviewWithReader({ ctx, route, settings, policy, prompt, system, root, signal, deadlineAt, log }) {
+async function runReview({ ctx, route, mode, settings, policy, prompt, diffs, paths, root, signal, userSignal, deadlineAt, log }) {
   const messages = [{ role: 'user', content: [{ type: 'text', text: prompt }] }]
-  const served = []
   const files = new Set()
   const budget = { bytes: 0, maxBytes: settings.maxReadBytes, calls: 0 }
   const results = []
   const ignore = policy
+  const corpus = createEvidenceCorpus()
+  corpus.addText(diffs)
+  corpus.addPaths(paths)
+  const store = createFindingStore({ mode, corpus, log })
+  const tools = reviewToolsFor(mode)
   let limits = settings
+  let activeSystem = ''
+  let contractBuilt = false
   let readerAvailable = settings.projectAccess === true
   let fellBack = false
-  let text = ''
+  let modelCalls = 0
+  let nudges = 0
+  let readerNoteSent = false
+  let toolCallsSeen = 0
+  let lastText = ''
 
-  /** Drops the oldest results from the model's context only; the served corpus keeps everything. */
+  /** Drops the oldest tool results from the model's context; the corpus keeps everything. */
   function elideOldResults() {
     let total = results.reduce((sum, entry) => sum + entry.bytes, 0)
     const elidable = Math.max(0, results.length - KEEP_RECENT_RESULTS)
     for (let index = 0; index < elidable && total > ELIDE_AFTER_BYTES; index += 1) {
       const entry = results[index]
       if (entry.elided) continue
-      const note = `[elided: ${entry.label} — ${entry.bytes} bytes read earlier and dropped from this context; read it again if you still need it]`
+      const note = `[elided: ${entry.label} — ${entry.bytes} bytes of tool output dropped from this context; ask again if you still need it]`
       entry.message.content = [{ type: 'text', text: note }]
       total -= entry.bytes - note.length
       entry.bytes = note.length
       entry.elided = true
     }
-    return total
   }
 
-  for (let step = 0; ; step += 1) {
-    const timeUp = Date.now() >= deadlineAt
-    const canRead = readerAvailable && budget.calls < settings.maxToolCalls && !timeUp
-    if (!canRead && budget.calls > 0 && step > 0) {
-      const why = timeUp ? 'reading time is up' : 'reader budget spent'
+  /**
+   * Every tool result of this run passes through here, reader and store alike, so
+   * one policy bounds the model's context and one figure describes it. A store
+   * result can be dropped like any other: `list_findings` shows the store again.
+   */
+  function recordResult(call, message, bytes) {
+    results.push({ message, label: summarizeCall(call), bytes, elided: false })
+    elideOldResults()
+  }
+
+  /**
+   * What stopped the run before the reviewer finished, as a value rather than as
+   * the sentence about it: the sentence is derived from this code in one place,
+   * so no part of the bookkeeping has to recognise a message it wrote itself.
+   */
+  const stop = { code: undefined, detail: '' }
+  function stopWith(code, error) {
+    if (userSignal?.aborted === true) {
+      stop.code = 'cancelled'
+      return
+    }
+    if (signal.aborted === true || error?.name === 'AbortError') {
+      stop.code = 'timeout'
+      return
+    }
+    stop.code = code
+    stop.detail = String(error)
+  }
+
+  let step = 0
+  for (; step < MAX_STEPS; step += 1) {
+    const readerNow = readerStop({ readerAvailable, budget, settings, deadlineAt })
+    const canRead = readerNow === undefined
+    if (!contractBuilt) {
+      // The contract is written once, from the answer this turn's tool list is
+      // built from: a run whose reading bound is already spent is told it cannot
+      // read, instead of being handed a section about the tools it will not get.
+      // A later withdrawal is announced in the conversation, not by rewriting
+      // the system prompt under a reviewer that has already read files.
+      activeSystem = systemPromptFor(mode, { reader: canRead })
+      contractBuilt = true
+    }
+    if (!canRead && !readerNoteSent && budget.calls > 0) {
+      readerNoteSent = true
       messages.push({
         role: 'user',
         content: [{
           type: 'text',
-          text: `[${why} after ${budget.calls} call(s) — answer now with the final JSON object and no further tool calls]`,
+          text: `[${readerNow} after ${budget.calls} call(s) — the read-only tools are no longer available. Record your findings with the review tools and call finish_review when you are done.]`,
         }],
       })
     }
 
     let answer
     try {
-      answer = await callModel(ctx, route, limits, messages, canRead ? READER_TOOLS : undefined, signal, system)
+      answer = await callModel(
+        ctx, route, limits, messages,
+        canRead ? [...tools, ...READER_TOOLS] : tools,
+        signal, activeSystem,
+      )
     } catch (error) {
-      // One degraded retry, so a rejected tool set or output cap still yields a report.
-      if (budget.calls === 0 && !fellBack) {
+      // One degraded retry, so a rejected output cap still yields a report. The
+      // review tools stay: without them there is no review to record at all.
+      if (modelCalls === 0 && !fellBack) {
         fellBack = true
         readerAvailable = false
         limits = { ...settings, maxTokens: Math.min(settings.maxTokens, FALLBACK_MAX_TOKENS) }
-        log.warn(`reviewer call failed (${String(error)}); retrying without project access and maxTokens=${limits.maxTokens}`)
-        answer = await callModel(ctx, route, limits, messages, undefined, signal, system)
-      } else {
-        throw error
-      }
-    }
-
-    text = answer.text
-    if (answer.calls.length === 0 || !canRead) {
-      return {
-        text,
-        served,
-        files: [...files],
-        budget,
-        fellBack,
-        contextBytes: results.reduce((sum, entry) => sum + entry.bytes, 0),
-      }
-    }
-
-    messages.push({
-      id: randomUUID(),
-      role: 'assistant',
-      content: answer.calls.map(call => ({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments })),
-      source: { kind: 'model', provider: route.provider, model: route.model },
-    })
-    for (const call of answer.calls) {
-      // The budget is rechecked per call: one model turn may ask for several,
-      // and every one of them still needs a result so the pairing stays valid.
-      const spent = budget.calls >= settings.maxToolCalls
-        ? `the reader budget is spent (${budget.calls}/${settings.maxToolCalls} calls)`
-        : budget.bytes >= budget.maxBytes
-          ? `the reader byte budget is spent (${budget.bytes}/${budget.maxBytes} bytes)`
-          : Date.now() >= deadlineAt ? 'reading time is up' : undefined
-      if (spent !== undefined) {
-        const refusal = `refused: ${spent} — answer now with the final JSON object and no further tool calls`
-        served.push(refusal)
+        activeSystem = systemPromptFor(mode, { reader: false })
         messages.push({
+          role: 'user',
+          content: [{ type: 'text', text: '[project access is off for this run — decide from the diffs above, record your findings with the review tools and call finish_review]' }],
+        })
+        log.warn(`reviewer call failed (${String(error)}); retrying without project access and maxTokens=${limits.maxTokens}`)
+        continue
+      }
+      stopWith('call-failed', error)
+      break
+    }
+    modelCalls += 1
+    lastText = answer.text
+
+    if (answer.calls.length > 0) {
+      toolCallsSeen += answer.calls.length
+      messages.push({
+        id: randomUUID(),
+        role: 'assistant',
+        content: answer.calls.map(call => ({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments })),
+        source: { kind: 'model', provider: route.provider, model: route.model },
+      })
+      const state = { tools, store, root, budget, signal, settings, ignore, deadlineAt, readerAvailable, corpus, files, log }
+      let ending
+      for (const call of answer.calls) {
+        // Every requested call gets exactly one result, whatever becomes of it,
+        // so the assistant tool-call blocks stay paired with their results.
+        let outcome
+        if (ending === undefined) {
+          try {
+            outcome = runTool(call, state)
+          } catch (error) {
+            // A tool that threw — a cancel or the clock running out mid-read —
+            // ends the run here, and everything already recorded still reports.
+            stopWith('tool-failed', error)
+            ending = stopSentence(stop)
+            outcome = { kind: 'refused', result: { text: `refused: ${ending}`, isError: true } }
+          }
+        } else {
+          outcome = { kind: 'refused', result: { text: `refused: ${ending}`, isError: true } }
+        }
+        const { kind, result } = outcome
+        const footer = kind === 'reader'
+          ? `\n[reader budget: ${budget.calls}/${settings.maxToolCalls} calls, ${Math.round(budget.bytes / 1024)}/${Math.round(budget.maxBytes / 1024)} KB]`
+          : ''
+        const message = {
           id: randomUUID(),
           role: 'tool',
           toolCallId: call.id,
-          isError: true,
-          content: [{ type: 'text', text: refusal }],
+          ...(result.isError === true ? { isError: true } : {}),
+          content: [{ type: 'text', text: `${result.text}${footer}` }],
           source: { kind: 'tool', callId: call.id },
-        })
-        log.info(`reader ${budget.calls}/${settings.maxToolCalls}: ${summarizeCall(call)} → refused (${spent})`)
-        continue
+        }
+        messages.push(message)
+        recordResult(call, message, result.text.length + footer.length)
       }
-
-      budget.calls += 1
-      const result = runReaderTool(call, root, budget, signal, settings, ignore)
-      if (typeof result.file === 'string') files.add(result.file)
-      // Only served content makes a file visible; a directory listing shows names, not contents.
-      for (const file of result.files ?? []) files.add(file)
-      served.push(result.text, ...(result.extraLines ?? []))
-      log.info(`reader ${budget.calls}/${settings.maxToolCalls}: ${summarizeCall(call)} → ${result.isError === true ? 'refused' : 'ok'}`)
-
-      const footer = `\n[reader budget: ${budget.calls}/${settings.maxToolCalls} calls, ${Math.round(budget.bytes / 1024)}/${Math.round(budget.maxBytes / 1024)} KB]`
-      const message = {
-        id: randomUUID(),
-        role: 'tool',
-        toolCallId: call.id,
-        ...(result.isError === true ? { isError: true } : {}),
-        content: [{ type: 'text', text: `${result.text}${footer}` }],
-        source: { kind: 'tool', callId: call.id },
-      }
-      messages.push(message)
-      results.push({ message, label: summarizeCall(call), bytes: result.text.length + footer.length, elided: false })
-      elideOldResults()
+      if (ending !== undefined) break
     }
+
+    if (store.finished === true) break
+    if (answer.calls.length > 0) continue
+
+    // The model stopped without finishing the review: ask it to finish, and
+    // build the report from the store when it will not.
+    nudges += 1
+    if (nudges > MAX_NUDGES) {
+      stop.code = 'not-finished'
+      break
+    }
+    messages.push({
+      role: 'user',
+      content: [{ type: 'text', text: '[the review is not finished — record anything you still stand behind with append_finding, then call finish_review; if it is complete as it stands, call it now]' }],
+    })
+  }
+  if (store.finished === true) {
+    // A review that closed is not stopped by anything — but one that closed
+    // after the store's cap could not record more than it did, and says so.
+    stop.code = undefined
+    stop.detail = ''
+  } else if (stop.code === undefined) {
+    stop.code = step >= MAX_STEPS ? 'out-of-turns' : 'no-record'
+  }
+  const incomplete = incompleteNote(stop, store)
+
+  const { kept, withheld } = gateFindings(store, corpus, mode)
+  const verdict = verdictFromFindings(kept, mode)
+  // A run that was cut short before recording anything has no report to make:
+  // reporting an empty pass would be a lie about what the reviewer concluded.
+  if (kept.length + withheld.length === 0 && incomplete !== undefined) {
+    return { failure: incomplete, lastText, cancelled: stop.code === 'cancelled', toolsUsed: toolCallsSeen > 0 }
+  }
+  return {
+    findings: kept,
+    withheld,
+    verdict,
+    summary: store.summaryText(),
+    incomplete,
+    store: store.stats(),
+    files: [...files],
+    budget,
+    fellBack,
+    contextBytes: results.reduce((sum, entry) => sum + entry.bytes, 0),
   }
 }
 
@@ -2273,7 +2619,7 @@ function renderPrompt({ diffs, stats, focus, language, cwd, mode, primary = [], 
     ? `"${language}"`
     : focus === '' ? 'English' : 'the same language as the review focus above'
   const required = mode.fields.filter(field => field.required).map(field => field.label === '' ? field.key : `"${field.key}"`)
-  const requiredText = required.length === 0 ? 'the fields the JSON object asks for' : required.join(', ')
+  const requiredText = required.length === 0 ? 'the fields your mode asks for' : required.join(', ')
   return `## Change set under review
 - mode: ${mode.label} (${mode.id})
 - change source: ${stats.sourceLabel}
@@ -2285,88 +2631,428 @@ ${diffs}
 ${focusBlock}${taskBlock}
 
 ## Language
-Write every text field of the JSON object in ${target}. Keep identifiers, paths and code verbatim; "evidence" is always copied from the diff, never translated or reformatted.
+Write every text field you record with the review tools in ${target}. Keep identifiers, paths and code verbatim; "evidence" is always copied from the diff, never translated or reformatted.
 
-## Before you answer
-Delete every finding that lacks a verbatim evidence quote from the diffs above, that leaves one of ${requiredText} unanswered, that depends on code you cannot see, or that is a matter of taste. Your summary must mention only what survives. Reporting nothing is a valid outcome; reporting an unproven claim is not.
+## Before you finish
+Delete every finding in the store that lacks a verbatim evidence quote from the diffs above or from a file you read, that leaves one of ${requiredText} unanswered, that depends on code you cannot see, or that is a matter of taste. Your summary must mention only what survives. Recording nothing is a valid outcome; recording an unproven claim is not.
 
-Review the change set now and reply with the JSON object only.`
+Review the change set now: record each finding with append_finding as soon as it is settled, record the summary with set_summary, and call finish_review when you are done.`
 }
 
-function extractJsonObject(text) {
-  const start = text.indexOf('{')
-  if (start < 0) return undefined
-  let depth = 0
-  let inString = false
-  let escaped = false
-  for (let i = start; i < text.length; i += 1) {
-    const ch = text[i]
-    if (inString) {
-      if (escaped) escaped = false
-      else if (ch === '\\') escaped = true
-      else if (ch === '"') inString = false
-      continue
-    }
-    if (ch === '"') inString = true
-    else if (ch === '{') depth += 1
-    else if (ch === '}') {
-      depth -= 1
-      if (depth === 0) return text.slice(start, i + 1)
-    }
-  }
-  return undefined
+/** Every key a finding call may carry: the structure first, then the mode's own fields. */
+function findingKeys(mode) {
+  return [...FINDING_KEYS, ...mode.fields.map(field => field.key)]
 }
 
 /**
- * One finding as the mode reads it: the structure the gate checks, and one
- * string per field the mode declared. Keys the mode did not declare are dropped
- * — the JSON contract it was given names its fields, and nothing else.
+ * The review tools — the protocol, fixed for every run whatever the mode, the
+ * settings file or the command line say. The report is assembled from what these
+ * store, so a review cannot be recorded without them.
  *
- * A severity the mode does not declare is lowered to the weakest one the mode
- * has rather than guessed upward, and the substitution is logged: an inflated
- * severity would survive the gate and mislead the reader.
+ * One table holds each tool once: its name, whether the call changes the review
+ * (those are what the store's call cap bounds), what it is for, and how its
+ * parameters are built from the mode in force. The model is offered exactly
+ * these names, the dispatcher classifies a call by them, and the store answers
+ * for every one of them — so a name cannot exist in one place and be missing
+ * from another, which for a call the store did not know would otherwise end the
+ * review instead of being refused.
  */
-function normalizeFinding(value, mode, log) {
-  if (value === null || typeof value !== 'object') return undefined
-  const text = key => (typeof value[key] === 'string' ? value[key].trim() : '')
-  const declared = text('severity')
-  let severity = mode.severities.find(entry => entry.id === declared)
-  if (severity === undefined) {
-    severity = weakestSeverity(mode)
-    if (declared !== '') log.warn(`the reviewer used the severity "${declared}", which mode "${mode.id}" does not declare; treated as "${severity.id}"`)
-  }
-  const finding = {
-    severity: severity.id,
-    category: text('category') === '' ? 'general' : text('category'),
-    file: text('file'),
-    line: Number.isInteger(value.line) ? value.line : null,
-    title: text('title'),
-  }
-  for (const field of mode.fields) finding[field.key] = text(field.key)
-  if (finding.title === '') {
-    // A finding that names no title is still a finding: the first words it did
-    // write become one, so the report never shows an anonymous entry.
-    const stated = mode.fields.map(field => finding[field.key]).find(entry => entry !== '')
-    finding.title = stated === undefined ? '' : stated.split('\n')[0].slice(0, 120)
-  }
-  return finding.title === '' ? undefined : finding
+const REVIEW_TOOL_SPECS = [
+  {
+    name: 'append_finding',
+    changes: true,
+    description: 'Record one finding in this review as soon as it is settled. Nothing written in your own answer reaches the report: the findings recorded with this tool are the review, and a run that stops early keeps everything already recorded. A required field left unanswered is recorded as withheld, and the result says so. "evidence" must quote verbatim a line from the diff or from a file one of your tools returned; the quote is checked when the finding is recorded and again when the report is built, and a quote that does not occur there is recorded as withheld rather than published. The result names the id the finding was recorded under and whether the gate can publish it.',
+    parameters: ({ properties, required }) => ({ type: 'object', properties, required, additionalProperties: false }),
+  },
+  {
+    name: 'update_finding',
+    changes: true,
+    description: 'Change a finding already recorded, by the id append_finding returned (list_findings shows every id). Send only the fields that change; everything else stays as it was. Use it when a later finding invalidates an earlier one, or when a quote, a field or a severity was wrong. The same checks run again and the result says whether the finding can now be published.',
+    parameters: ({ properties, id }) => ({ type: 'object', properties: { id, ...properties }, required: ['id'], additionalProperties: false }),
+  },
+  {
+    name: 'delete_finding',
+    changes: true,
+    description: 'Drop one finding from the store, by id. Use it for a finding a later look invalidated, so the report never carries a claim you no longer stand behind. The result names what was removed.',
+    parameters: ({ id }) => ({ type: 'object', properties: { id }, required: ['id'], additionalProperties: false }),
+  },
+  {
+    name: 'list_findings',
+    changes: false,
+    description: 'Every finding recorded so far, in the order it was recorded: its id, severity, file:line, title, and whether the evidence gate can publish it (a withheld one carries its reason). Takes no arguments. Call it before you finish.',
+    parameters: () => ({ type: 'object', properties: {}, required: [], additionalProperties: false }),
+  },
+  {
+    name: 'set_summary',
+    changes: false,
+    description: 'Record the 2-4 factual sentences that open the report: what the change set does and whether it holds up, mentioning only the findings you kept. Calling it again replaces the summary. Record it before you call finish_review.',
+    parameters: () => ({
+      type: 'object',
+      properties: { summary: { type: 'string', description: 'the summary the report opens with' } },
+      required: ['summary'],
+      additionalProperties: false,
+    }),
+  },
+  {
+    name: 'finish_review',
+    changes: false,
+    description: 'End the review. The report is built from everything recorded at that moment — the findings and the summary — so record what you stand behind first. Call it once, when the review is complete: recording nothing and finishing is a complete review when there is nothing to report. Takes no arguments.',
+    parameters: () => ({ type: 'object', properties: {}, required: [], additionalProperties: false }),
+  },
+]
+
+/** The protocol's names, derived from the table so the two can never disagree. */
+const REVIEW_TOOL_NAMES = new Set(REVIEW_TOOL_SPECS.map(tool => tool.name))
+
+/** The review tools that change the review, and are what the store's cap bounds. */
+const STORE_CHANGING_NAMES = new Set(REVIEW_TOOL_SPECS.filter(tool => tool.changes).map(tool => tool.name))
+
+/** The line a tool result, a log entry and `list_findings` name one finding by. */
+function findingLine(mode, finding) {
+  const where = finding.file === '' ? '' : ` ${finding.file}${finding.line === null ? '' : `:${finding.line}`}`
+  return `${finding.id} [${severityLabel(mode, finding.severity)}]${where} — ${finding.title === '' ? '(unnamed)' : finding.title}`
 }
 
-function parseVerdict(raw, mode, log) {
-  const json = extractJsonObject(raw)
-  if (json === undefined) return { failure: 'the reviewer returned no JSON object' }
-  let parsed
-  try {
-    parsed = JSON.parse(json)
-  } catch (error) {
-    return { failure: `the reviewer's JSON did not parse: ${String(error)}` }
+/**
+ * The tools the reviewer records the review with, as the model is offered them:
+ * the table's names and descriptions, with the parameters each builds from the
+ * mode in force. What `append_finding` and `update_finding` accept is exactly
+ * the finding shape that mode declares — its severity vocabulary, its fields and
+ * their guides. That is the whole of what a mode decides about the tools, and
+ * the reason a mode a user wrote is recordable at all.
+ */
+function reviewToolsFor(mode) {
+  const properties = {}
+  for (const field of FINDING_FIELDS) properties[field.key] = field.property(mode)
+  for (const field of mode.fields) {
+    properties[field.key] = {
+      type: 'string',
+      description: field.guide === '' ? (field.label === '' ? field.key : field.label) : field.guide,
+    }
+  }
+  const shapeFor = {
+    properties,
+    id: { type: 'string', description: 'the id append_finding returned, for example "f2"' },
+    required: [
+      ...FINDING_FIELDS.filter(field => field.required).map(field => field.key),
+      ...mode.fields.filter(field => field.required).map(field => field.key),
+    ],
+  }
+  return REVIEW_TOOL_SPECS.map(tool => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters(shapeFor),
+  }))
+}
+
+/**
+ * The evidence one run may quote: the diff it was shown, everything the reader
+ * tools returned, and the files those results made visible. It only ever grows,
+ * so a finding that holds up when it is recorded cannot fail later — while one
+ * that was withheld can become provable once the file behind it has been read.
+ *
+ * Nothing else belongs here: a refusal is not a line of code, a directory
+ * listing is not content, and the reviewer's own tool calls are not evidence.
+ */
+function createEvidenceCorpus() {
+  const forms = new Set()
+  const paths = new Set()
+  const absorb = text => {
+    for (const form of diffQuoteForms(text)) forms.add(form)
   }
   return {
-    declared: parsed.verdict === 'fail' || parsed.verdict === 'warn' ? parsed.verdict : 'pass',
-    summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : '',
-    findings: Array.isArray(parsed.findings)
-      ? parsed.findings.map(finding => normalizeFinding(finding, mode, log)).filter(Boolean)
-      : [],
+    addText(text) { absorb(text) },
+    addLines(lines) { for (const line of lines) absorb(line) },
+    addPaths(list) { for (const path of list) paths.add(canonicalPath(path)) },
+    /** The first thing wrong with the proof, or undefined when it holds up. */
+    proof(finding) {
+      if (finding.file === '') return 'no file named — a finding says which file it is about'
+      if (!paths.has(canonicalPath(finding.file))) return 'the named file is not one the reviewer could see'
+      const quoted = finding.evidence.split('\n').map(line => line.trim()).filter(line => line !== '')
+      if (quoted.length === 0) return 'no evidence quoted'
+      const missing = quoted.find(line => !forms.has(line))
+      return missing === undefined ? undefined : `quoted evidence does not occur in the diff or the reads: ${clamp(missing, 120)}`
+    },
+  }
+}
+
+/**
+ * Why one finding cannot be published, or undefined when it can.
+ *
+ * The proof check is the plugin's own and no mode can relax it. The required
+ * fields are the mode's: `cr` asks for the impact and the route that reaches the
+ * defect, `arc` for the consequence and the alternative it proposes, a mode the
+ * user wrote for whatever it declared. The title comes first because that is
+ * what the report and the withheld list call the finding.
+ */
+function gateReason(finding, corpus, mode) {
+  if (finding.title === '') {
+    return 'nothing to name it by — a finding needs a title, or one answered field to take one from'
+  }
+  const proof = corpus.proof(finding)
+  if (proof !== undefined) return proof
+  const unanswered = mode.fields.find(field => field.required && finding[field.key] === '')
+  if (unanswered === undefined) return undefined
+  return `missing required field "${unanswered.key}" (${unanswered.label === '' ? unanswered.key : unanswered.label}) — a finding that cannot state it is not published`
+}
+
+/** Splits the store into what the report publishes and what it names as withheld. */
+function gateFindings(store, corpus, mode) {
+  const kept = []
+  const withheld = []
+  for (const finding of store.all()) {
+    const reason = gateReason(finding, corpus, mode)
+    if (reason === undefined) kept.push(finding)
+    else {
+      // The keys a withheld finding is named by, from the structure table, so a
+      // structural key cannot exist in the report and be missing from the list.
+      const claim = {}
+      for (const field of FINDING_FIELDS) {
+        if (field.named === true) claim[field.key] = finding[field.key]
+      }
+      withheld.push({ ...claim, reason })
+    }
+  }
+  return { kept, withheld }
+}
+
+/**
+ * The findings one run records, in the order it records them.
+ *
+ * The store is the review: the report is assembled from it, so a call that
+ * fails, a budget that runs out or a cancel loses nothing already recorded.
+ * Every write is checked before it lands — a call the store does not understand
+ * changes nothing and answers with what was wrong with it, so the reviewer can
+ * fix the call and make it again. A finding that only fails the evidence gate is
+ * still recorded, as withheld, and stays visible in the report.
+ */
+function createFindingStore({ mode, corpus, log }) {
+  const findings = []
+  const byId = new Map()
+  const counts = { calls: 0, appended: 0, updated: 0, deleted: 0 }
+  let summary = ''
+  let finished = false
+  let capped = false
+  let lastId = 0
+
+  const text = (args, key) => (typeof args[key] === 'string' ? args[key].trim() : '')
+
+  /** The findings recorded so far, for a refusal to be actionable. */
+  function knownIds() {
+    return findings.length === 0
+      ? 'nothing is recorded yet — use append_finding first'
+      : `recorded: ${findings.map(finding => `${finding.id} (${finding.title === '' ? 'unnamed' : finding.title})`).join(', ')}`
+  }
+
+  /** The findings the gate cannot publish right now — the corpus only grows. */
+  function withheldCount() {
+    return findings.reduce((sum, finding) => sum + (gateReason(finding, corpus, mode) === undefined ? 0 : 1), 0)
+  }
+
+  /** What every result ends with, so the reviewer always knows what the store holds. */
+  function footer() {
+    return `\n[finding store: ${findings.length} of ${MAX_FINDINGS} recorded, ${withheldCount()} withheld${summary === '' ? ', no summary yet' : ''}]`
+  }
+
+  /** The refusal one call gets, as the reviewer will read it. */
+  function refusal(lines) {
+    return { text: `refused: ${lines.join('; ')}`, isError: true }
+  }
+
+  /** One finding with nothing filled in, over the structure and the mode's fields. */
+  function blank() {
+    const finding = {}
+    for (const field of FINDING_FIELDS) finding[field.key] = field.blank
+    for (const field of mode.fields) finding[field.key] = ''
+    return finding
+  }
+
+  /** The problems that make one call unusable — all of them, so one retry fixes everything. */
+  function problems(args, tool) {
+    const found = []
+    const keys = findingKeys(mode)
+    for (const key of Object.keys(args)) {
+      if (!keys.includes(key)) found.push(`"${key}" is not a finding field; ${tool} takes: ${keys.join(', ')}`)
+    }
+    for (const key of keys) {
+      if (!Object.hasOwn(args, key)) continue
+      const field = FINDING_FIELDS.find(entry => entry.key === key)
+      // A mode's own field is prose and must be a string; a structural key says
+      // for itself what it accepts.
+      const why = field === undefined
+        ? (typeof args[key] === 'string' ? undefined : `"${key}" must be a string`)
+        : field.reject(args[key], mode)
+      if (why !== undefined) found.push(why)
+    }
+    return found
+  }
+
+  /** The finding a call describes, over the shape the mode declares. */
+  function shape(args, base) {
+    const finding = {}
+    for (const field of FINDING_FIELDS) finding[field.key] = base[field.key]
+    for (const field of mode.fields) finding[field.key] = base[field.key]
+    for (const field of FINDING_FIELDS) {
+      if (Object.hasOwn(args, field.key)) finding[field.key] = field.read(args[field.key])
+    }
+    for (const field of mode.fields) {
+      if (Object.hasOwn(args, field.key)) finding[field.key] = String(args[field.key]).trim()
+    }
+    if (finding.category === '') finding.category = 'general'
+    if (finding.title === '') {
+      // A finding that names no title is still a finding: the first words it did
+      // write become one, so the report never shows an anonymous entry.
+      const stated = mode.fields.map(field => finding[field.key]).find(entry => entry !== '')
+      finding.title = stated === undefined ? '' : stated.split('\n')[0].slice(0, 120)
+    }
+    return finding
+  }
+
+  function append(args) {
+    const found = problems(args, 'append_finding')
+    if (found.length > 0) return refusal(found)
+    if (text(args, 'severity') === '') {
+      return refusal([`"severity" is required — use one of: ${mode.severities.map(entry => entry.id).join(', ')}`])
+    }
+    if (findings.length >= MAX_FINDINGS) {
+      return refusal([`the review already holds ${MAX_FINDINGS} findings, the maximum; delete the ones you no longer stand behind with delete_finding, or call finish_review`])
+    }
+    lastId += 1
+    const finding = { id: `f${lastId}`, ...shape(args, blank()) }
+    findings.push(finding)
+    byId.set(finding.id, finding)
+    counts.appended += 1
+    const reason = gateReason(finding, corpus, mode)
+    log.info(`store ${counts.calls}: append_finding → ${findingLine(mode, finding)} · ${reason === undefined ? 'provable' : `withheld (${clamp(reason, 80)})`}`)
+    return {
+      text: reason === undefined
+        ? `${findingLine(mode, finding)} — recorded, and the gate can publish it.${footer()}`
+        : `${findingLine(mode, finding)} — recorded, withheld: ${reason}\nFix it with update_finding on ${finding.id}, or drop it with delete_finding.${footer()}`,
+    }
+  }
+
+  function update(args) {
+    const id = text(args, 'id')
+    if (id === '') return refusal(['update_finding needs the "id" of the finding to change — list_findings shows them'])
+    const finding = byId.get(id)
+    if (finding === undefined) return refusal([`no finding "${id}" in the store — ${knownIds()}`])
+    const changes = { ...args }
+    delete changes.id
+    const changed = Object.keys(changes)
+    if (changed.length === 0) return refusal([`update_finding needs at least one field to change — list_findings shows what ${id} holds`])
+    const found = problems(changes, 'update_finding')
+    if (found.length > 0) return refusal(found)
+    Object.assign(finding, shape(changes, finding))
+    counts.updated += 1
+    const reason = gateReason(finding, corpus, mode)
+    log.info(`store ${counts.calls}: update_finding ${id} (${changed.join(', ')}) → ${reason === undefined ? 'provable' : `withheld (${clamp(reason, 80)})`}`)
+    return {
+      text: reason === undefined
+        ? `${findingLine(mode, finding)} — updated (${changed.join(', ')}), and the gate can publish it.${footer()}`
+        : `${findingLine(mode, finding)} — updated (${changed.join(', ')}), still withheld: ${reason}${footer()}`,
+    }
+  }
+
+  function remove(args) {
+    const id = text(args, 'id')
+    if (id === '') return refusal(['delete_finding needs the "id" of the finding to drop — list_findings shows them'])
+    const index = findings.findIndex(entry => entry.id === id)
+    if (index < 0) return refusal([`no finding "${id}" in the store — ${knownIds()}`])
+    const [removed] = findings.splice(index, 1)
+    byId.delete(id)
+    counts.deleted += 1
+    log.info(`store ${counts.calls}: delete_finding → ${findingLine(mode, removed)}`)
+    return { text: `${findingLine(mode, removed)} — deleted.${footer()}` }
+  }
+
+  function list(args) {
+    const extra = Object.keys(args)
+    if (extra.length > 0) return refusal([`list_findings takes no arguments (got ${extra.map(key => `"${key}"`).join(', ')})`])
+    if (findings.length === 0) {
+      return { text: `nothing recorded yet — call finish_review if this review has no findings.${footer()}` }
+    }
+    const rows = findings.map(finding => {
+      const reason = gateReason(finding, corpus, mode)
+      return `${findingLine(mode, finding)} · ${reason === undefined ? 'provable' : `withheld: ${reason}`}`
+    })
+    return { text: `${rows.join('\n')}${footer()}` }
+  }
+
+  function setSummary(args) {
+    const extra = Object.keys(args).filter(key => key !== 'summary')
+    if (extra.length > 0) {
+      return refusal([`set_summary takes only "summary" (got ${extra.map(key => `"${key}"`).join(', ')}) — finish_review is the tool that ends the review`])
+    }
+    if (typeof args.summary !== 'string' || args.summary.trim() === '') {
+      return refusal(['set_summary needs a non-empty "summary" string — the 2-4 sentences the report opens with'])
+    }
+    const replaced = summary !== ''
+    summary = args.summary.trim()
+    log.info(`store ${counts.calls}: set_summary → ${summary.length} characters`)
+    return { text: `${replaced ? 'summary replaced' : 'summary recorded'} (${summary.length} characters).${footer()}` }
+  }
+
+  function finish(args) {
+    const extra = Object.keys(args)
+    if (extra.length > 0) {
+      return refusal([`finish_review takes no arguments (got ${extra.map(key => `"${key}"`).join(', ')}) — record the summary with set_summary and call it again`])
+    }
+    finished = true
+    log.info(`store ${counts.calls}: finish_review → ${findings.length} recorded, ${withheldCount()} withheld`)
+    return { text: `review finished: ${findings.length} finding(s) recorded, ${withheldCount()} withheld${summary === '' ? ', no summary recorded' : ''}.` }
+  }
+
+  /**
+   * The handlers, keyed by the protocol's own names. `run` dispatches on this
+   * map and nothing else: a call it does not know is refused instead of falling
+   * through to the arm that ends the review, and the check below makes a tool
+   * the table declares but the store cannot answer a loud failure here rather
+   * than a silent one at run time.
+   */
+  const handlers = {
+    append_finding: append,
+    update_finding: update,
+    delete_finding: remove,
+    list_findings: list,
+    set_summary: setSummary,
+    finish_review: finish,
+  }
+  for (const tool of REVIEW_TOOL_SPECS) {
+    if (typeof handlers[tool.name] !== 'function') {
+      throw new Error(`code-review: no store handler for the review tool "${tool.name}"`)
+    }
+  }
+
+  /**
+   * One call against the store: it either changes something or answers why it
+   * did not.
+   *
+   * The call cap bounds what the review can change. It never refuses the calls
+   * that inspect the store, describe it or end the run, so a reviewer that
+   * reached it can still list what it has, record its summary and close the
+   * review — which is then marked as short by `capped`.
+   */
+  function run(name, args) {
+    counts.calls += 1
+    const handler = handlers[name]
+    if (typeof handler !== 'function') {
+      return refusal([`the store has no review tool "${name}" — it takes: ${Object.keys(handlers).join(', ')}`])
+    }
+    if (STORE_CHANGING_NAMES.has(name) && counts.calls > MAX_STORE_CALLS) {
+      capped = true
+      return refusal([`this run has used its ${MAX_STORE_CALLS} finding-tool calls and the store records nothing more; list what you have with list_findings, record the summary with set_summary and call finish_review`])
+    }
+    if (finished) return refusal(['the review is already finished'])
+    return handler(args)
+  }
+
+  return {
+    run,
+    all: () => [...findings],
+    summaryText: () => summary,
+    stats: () => ({ ...counts }),
+    get finished() { return finished },
+    get capped() { return capped },
   }
 }
 
@@ -2381,22 +3067,6 @@ function countBySeverity(findings, mode) {
 /** How the mode names one severity, for a report line or a notice. */
 function severityLabel(mode, id) {
   return mode.severities.find(entry => entry.id === id)?.label ?? id
-}
-
-/**
- * The severity a mode falls back to when the reviewer names one the mode does
- * not declare: the entry that claims least, so the substitution can never
- * inflate the verdict. The order the file lists the table in decides nothing —
- * a mode is free to write its severities strongest-last — and among entries that
- * claim the same, the last one is the answer, which is the weakest end of a
- * table written the usual way round.
- */
-function weakestSeverity(mode) {
-  let weakest = mode.severities[mode.severities.length - 1]
-  for (const entry of mode.severities) {
-    if (VERDICT_WEIGHT[entry.verdict] <= VERDICT_WEIGHT[weakest.verdict]) weakest = entry
-  }
-  return weakest
 }
 
 function canonicalPath(path) {
@@ -2423,61 +3093,15 @@ function diffQuoteForms(diffText) {
   return forms
 }
 
-/**
- * Keeps only findings that name a visible file, quote their proof, and answer
- * every field their mode made required.
- *
- * The first two checks are the plugin's own and no mode can relax them. The
- * third is the mode's: `cr` requires the impact and the route that reaches the
- * defect, `arc` requires the consequence and the alternative it proposes, and a
- * mode the user wrote requires whatever it declared. Anything that fails is
- * withheld and named, never dropped in silence.
- */
-function verifyFindings(findings, servedText, visiblePaths, mode) {
-  const forms = diffQuoteForms(servedText)
-  const paths = new Set(visiblePaths.map(canonicalPath))
-  const kept = []
-  const withheld = []
-
-  for (const finding of findings) {
-    const claim = {
-      file: finding.file,
-      line: finding.line,
-      severity: finding.severity,
-      title: finding.title,
-    }
-    if (finding.file === '' || !paths.has(canonicalPath(finding.file))) {
-      withheld.push({ ...claim, reason: 'the named file is not one the reviewer could see' })
-      continue
-    }
-    const quoted = finding.evidence.split('\n').map(line => line.trim()).filter(line => line !== '')
-    if (quoted.length === 0) {
-      withheld.push({ ...claim, reason: 'no evidence quoted' })
-      continue
-    }
-    const missing = quoted.find(line => !forms.has(line))
-    if (missing !== undefined) {
-      withheld.push({ ...claim, reason: `quoted evidence does not occur in the diff or the reads: ${clamp(missing, 120)}` })
-      continue
-    }
-    const unanswered = mode.fields.find(field => field.required && finding[field.key] === '')
-    if (unanswered !== undefined) {
-      withheld.push({ ...claim, reason: `missing required field "${unanswered.key}" (${unanswered.label === '' ? unanswered.key : unanswered.label}) — a finding that cannot state it is not published` })
-      continue
-    }
-    kept.push(finding)
-  }
-
-  return { kept, withheld }
-}
-
 /** The verdict the surviving findings force, through the severity table of their mode. */
 function verdictFromFindings(findings, mode) {
   let verdict = 'pass'
   for (const finding of findings) {
-    const weight = mode.severities.find(entry => entry.id === finding.severity)?.verdict ?? 'warn'
-    if (weight === 'fail') return 'fail'
-    if (weight === 'warn') verdict = 'warn'
+    // Every recorded severity is one the mode declares: the store refuses any
+    // other, so this can only fall back for a table the run itself changed.
+    const forced = mode.severities.find(entry => entry.id === finding.severity)?.verdict ?? 'pass'
+    if (forced === 'fail') return 'fail'
+    if (forced === 'warn') verdict = 'warn'
   }
   return verdict
 }
@@ -2491,7 +3115,7 @@ function effortNote(route) {
   return route.reasoningEffort === undefined ? '' : ` · thinking: ${route.reasoningEffort}`
 }
 
-function renderReport({ verdict, summary, findings, withheld, stats, route, mode }) {
+function renderReport({ verdict, summary, findings, withheld, stats, route, mode, incomplete }) {
   const counts = countBySeverity(findings, mode)
   const head = mode.verdicts[verdict] ?? verdict.toUpperCase()
   const detail = mode.severities
@@ -2520,11 +3144,19 @@ function renderReport({ verdict, summary, findings, withheld, stats, route, mode
     ...(stats.recordBehind > 0
       ? [`- note: ${stats.recordBehind} newer recorded turn(s) have no comparison in this Host process; this review covers turn ${stats.turn}`]
       : []),
+    // A run that stopped early still hands over what it recorded — and says so
+    // where the verdict is read, never in a footnote.
+    ...(incomplete === undefined
+      ? []
+      : [`- incomplete: ${incomplete} — the findings below are the ones the reviewer recorded before it stopped.`]),
     ...(stats.context === undefined || stats.context.calls === 0
       ? []
       : [`- project context read: ${stats.context.calls} tool call(s), ${stats.context.files.length} file(s)`]),
+    ...(stats.store === undefined
+      ? []
+      : [`- finding store: ${stats.store.calls} tool call(s), ${stats.store.appended} recorded, ${stats.store.updated} updated, ${stats.store.deleted} deleted`]),
     `- reviewer: ${route.provider}/${route.model}${effortNote(route)}` +
-      (stats.reviewerFallback === true ? ' · degraded retry (no project access, smaller output cap)' : ''),
+      (stats.reviewerFallback === true ? ' · degraded retry (diff only, smaller output cap)' : ''),
   ]
   if (withheld.length > 0) {
     lines.push('', '_The reviewer also raised claims it could not prove from the diff. They are listed at the end and carry no verdict._')
@@ -2555,7 +3187,7 @@ function renderReport({ verdict, summary, findings, withheld, stats, route, mode
   return lines.join('\n')
 }
 
-function noticeSummary({ verdict, findings, withheld, stats, mode }) {
+function noticeSummary({ verdict, findings, withheld, stats, mode, incomplete }) {
   const counts = countBySeverity(findings, mode)
   const detail = mode.severities
     .filter(severity => counts[severity.id] > 0)
@@ -2568,6 +3200,7 @@ function noticeSummary({ verdict, findings, withheld, stats, mode }) {
   ]
   if (withheld.length > 0) parts.push(`${withheld.length} withheld as unprovable`)
   if ((stats.ignore?.count ?? 0) > 0) parts.push(`${stats.ignore.count} ignored`)
+  if (incomplete !== undefined) parts.push('incomplete')
   const summary = parts.join(' · ')
   return summary.length <= NOTICE_SUMMARY_MAX_CHARS
     ? summary
@@ -2575,7 +3208,7 @@ function noticeSummary({ verdict, findings, withheld, stats, mode }) {
 }
 
 /** The report as the Agent reads it: no payload, and plainly a notice rather than a request. */
-function renderAgentNotice({ verdict, summary, findings, withheld, stats, route, mode }) {
+function renderAgentNotice({ verdict, summary, findings, withheld, stats, route, mode, incomplete }) {
   const lines = [
     `[code-review] The user ran /review mode=${mode.id} (${mode.label}) on the code changes of this workspace. The same report is rendered to them as a card. This is a notice, not a request: do not change code unless the user asks you to.`,
     '',
@@ -2590,6 +3223,9 @@ function renderAgentNotice({ verdict, summary, findings, withheld, stats, route,
     ...(stats.recordBehind > 0
       ? [`note: this reviews turn ${stats.turn}; ${stats.recordBehind} newer recorded turn(s) have no comparison in this Host process`]
       : []),
+    ...(incomplete === undefined
+      ? []
+      : [`note: this review is incomplete — ${incomplete}; the findings below are the ones recorded before it stopped`]),
     ...(stats.context === undefined || stats.context.calls === 0
       ? []
       : [`project context read: ${stats.context.calls} tool call(s)${stats.context.files.length === 0 ? '' : ` — ${stats.context.files.join(', ')}`}`]),
@@ -2817,9 +3453,8 @@ export function apply(ctx) {
         primary,
         others,
       })
-      const system = systemPromptFor(mode)
-
       const readerOn = settings.projectAccess === true
+
       const maxToolCalls = positiveInt(settings.maxToolCalls, DEFAULTS.maxToolCalls)
       const timeoutMs = positiveInt(settings.timeoutMs, DEFAULTS.timeoutMs)
       const deadlineAt = Date.now() + Math.round(timeoutMs * ratio(settings.toolDeadlineRatio, DEFAULTS.toolDeadlineRatio))
@@ -2846,9 +3481,10 @@ export function apply(ctx) {
 
       let review
       try {
-        review = await reviewWithReader({
+        review = await runReview({
           ctx,
           route,
+          mode,
           settings: {
             maxTokens: positiveInt(settings.maxTokens, DEFAULTS.maxTokens),
             temperature: typeof settings.temperature === 'number' ? settings.temperature : DEFAULTS.temperature,
@@ -2859,9 +3495,11 @@ export function apply(ctx) {
           },
           policy: collected.policy,
           prompt,
-          system,
+          diffs: collected.diffs,
+          paths: collected.paths,
           root: collected.summary.cwd,
           signal: combined,
+          userSignal: signal,
           deadlineAt,
           log,
         })
@@ -2871,37 +3509,42 @@ export function apply(ctx) {
         return { kind: 'error', text: `code-review: the reviewer call failed — ${String(error)}` }
       }
 
-      const raw = review.text
+      if (review.failure !== undefined) {
+        if (review.cancelled === true) return { kind: 'error', text: 'code-review: review cancelled.' }
+        log.warn(`unusable reviewer output: ${review.failure}`)
+        const last = review.lastText === undefined || review.lastText.trim() === ''
+          ? ''
+          : `\n\nIts last message was:\n\n${clamp(review.lastText, 2000)}`
+        // The route hint is for the one failure it explains — a model that never
+        // called a tool at all; a run that did and still ended empty says why.
+        const hint = review.toolsUsed === true
+          ? ''
+          : ' This review needs a route whose model can call tools.'
+        return {
+          kind: 'error',
+          text: `code-review: the reviewer recorded no finding — ${review.failure}.${hint} Run /review again.` + last,
+        }
+      }
+
+      const { findings: kept, withheld, verdict, summary, incomplete } = review
       stats.context = {
         calls: review.budget.calls,
         files: review.files,
         bytes: review.budget.bytes,
         keptBytes: review.contextBytes,
       }
+      stats.store = review.store
       stats.reviewerFallback = review.fellBack === true
-      const parsed = parseVerdict(raw, mode, log)
-      if (parsed.failure !== undefined) {
-        log.warn(`unusable reviewer output: ${parsed.failure}`)
-        return { kind: 'error', text: `code-review: ${parsed.failure}. Raw output:\n\n${clamp(raw, 4000)}` }
-      }
-
-      const haystack = [collected.diffs, ...review.served].join('\n')
-      const { kept, withheld } = verifyFindings(
-        parsed.findings,
-        haystack,
-        [...collected.paths, ...review.files],
-        mode,
-      )
-      const verdict = verdictFromFindings(kept, mode)
       const noticeMode = NOTIFY_MODES.has(settings.notifyAgent) ? settings.notifyAgent : DEFAULTS.notifyAgent
       const reportInput = {
         verdict,
-        summary: parsed.summary,
+        summary,
         findings: kept,
         withheld,
         stats,
         route,
         mode,
+        incomplete,
       }
       const payload = {
         schema: SCHEMA,
@@ -2918,9 +3561,10 @@ export function apply(ctx) {
         scope: stats.scope,
         focus,
         verdict,
-        summary: parsed.summary,
+        summary,
         findings: kept,
         withheld,
+        incomplete: incomplete ?? null,
         stats,
         reviewer: route,
         turn: stats.turn,
@@ -2929,8 +3573,9 @@ export function apply(ctx) {
       }
 
       log.info(
-        `review done: ${mode.id} ${verdict} (reviewer declared ${parsed.declared}), ` +
-        `${kept.length} proven finding(s), ${withheld.length} withheld`,
+        `review done: ${mode.id} ${verdict}${incomplete === undefined ? '' : ' (incomplete)'}, ` +
+        `${kept.length} proven finding(s), ${withheld.length} withheld, ` +
+        `${review.store.calls} store call(s) (${review.store.appended} recorded, ${review.store.updated} updated, ${review.store.deleted} deleted)`,
       )
       notifyAgent(agent, noticeMode, {
         id: randomUUID(),

@@ -10,6 +10,15 @@ vocabulary that decides the verdict, and a preset of run settings. Two ship with
 the plugin — `cr`, a code review, and `arc`, an architecture review — and you add
 your own under `modes` in the settings file.
 
+**The reviewer records the review with tools.** It appends each finding to a
+finding store as soon as it is settled, may update or delete what a later look
+invalidated, and calls `finish_review` when it is done; the report is assembled
+from that store, never from the model's own prose. A review that is cut short —
+a broken stream, a timeout, a cancel, a model that never finishes — therefore
+still hands you every finding recorded before it stopped, and says it is
+incomplete. Those tools are the protocol: no setting, no mode and no command
+line adds, removes or renames one.
+
 **The report is yours alone.** By default the agent is not told about the review:
 no turn starts, nothing is read into its context and no code changes. You read the
 report, decide what matters and hand the agent an instruction in your own words.
@@ -73,7 +82,10 @@ this run, the **fields** one finding states, the **severities** (and with them t
 verdict), and a **preset** of the run settings. What no mode decides is the
 evidence gate: every finding quotes the line that proves it, the quote is checked
 mechanically against the diff and everything the reader tools returned, and a
-finding that cannot state what its mode requires is withheld and named.
+finding that cannot state what its mode requires is withheld and named. What no
+mode decides either is the tool set: a mode chooses the vocabulary its findings
+are recorded in — its severity ids, its fields, its categories — while the six
+review tools themselves are offered on every run, whatever the mode says.
 
 The two built-in modes:
 
@@ -120,7 +132,7 @@ shape of an entry — every key is optional, and this example is a working mode:
 | `systemPrompt` | The reviewer's role, what it looks for, and what it never reports. It is followed by the contract below, which it cannot change. |
 | `task` | Extra instructions for this run, added to the change set as `## Mode task`. Use it to narrow the assignment; it can never widen the change set. |
 | `categories` | The categories the reviewer may use, listed in the contract and shown on the card. |
-| `fields` | The narrative fields of one finding, in the order the report and the card show them: `key` (required), `label` (empty renders the text bare), `required`, `block` (render as quoted code), `guide` (what the field must contain, quoted in the contract). `severity`, `category`, `file`, `line` and `title` are the finding's structure and cannot be field keys. |
+| `fields` | The narrative fields of one finding, in the order the report and the card show them: `key` (required), `label` (empty renders the text bare), `required`, `block` (render as quoted code), `guide` (what the field must contain, quoted in the contract and used as the tool parameter's description). `severity`, `category`, `file`, `line`, `title`, `summary` and `id` are the finding's structure and cannot be field keys. |
 | `severities` | The vocabulary the reviewer may use and the verdict each forces: `id`, `label`, `tone` (`error`, `warn`, `success`, `muted`), `verdict` (`fail`, `warn`, `pass`) and `meaning` (quoted in the contract, so an arbitrary vocabulary still defines itself). The verdict of a run is the strongest one its surviving findings force. |
 | `verdicts` | What the mode calls `pass`, `warn` and `fail` — `sound`, `worth discussing`, `decide before merge`. The chip keeps the machine verdict's colour. |
 | `settings` | A preset of the run settings below: the mode's values win over the file's own and lose to what you type after `/review`. `"settings": { "reasoningEffort": "max" }` is how one mode thinks harder than the rest without changing the global setting. An empty value presets nothing: the layer below stays in force. |
@@ -130,10 +142,11 @@ out of `fields` and it is appended, set `required: false` and it is put back.
 And a mode that declares no `fields` gets the minimum every mode states —
 `problem` and `evidence` — never `cr`'s longer list.
 
-A severity table is read by weight, not by position: whichever order it is
-written in, a severity the reviewer names but the mode does not declare is
-lowered to the one that claims least, so a substitution can never inflate a
-verdict — and a run's verdict is the strongest one its surviving findings force.
+A severity is used exactly as the mode declares it. A severity the reviewer names
+that the mode does not declare is refused by name — the refusal lists the ids the
+mode does carry — and the call changes nothing, so the reviewer fixes it and calls
+again. Nothing is lowered, substituted or guessed: a run's verdict is the
+strongest one its surviving findings force through the mode's own table.
 
 Nothing is reported in silence either: a field key that is reserved, a duplicate,
 a severity with an unknown `verdict` or `tone`, a setting a mode may not set —
@@ -207,18 +220,42 @@ follows from it — is yours to give.
 4. the reviewer runs under the mode's prompt plus the contract no mode can
    change, and may read the workspace with read-only tools when the diff alone
    cannot settle a question;
-5. every finding must pass the evidence gate, and state the fields its mode made
-   required, or it is withheld;
-6. the report becomes the card. It stops there unless you say otherwise.
+5. it records the review with its own tools: one `append_finding` per finding as
+   soon as it is settled, `update_finding` or `delete_finding` when something
+   later invalidates what it wrote, `set_summary` for the report's opening, and
+   `finish_review` to end the run;
+6. every recorded finding must pass the evidence gate, and state the fields its
+   mode made required, or it is **withheld** — recorded, listed with its reason,
+   and never carrying the verdict. The gate runs when the finding is recorded and
+   again when the report is built;
+7. the report is assembled from the store and becomes the card. It stops there
+   unless you say otherwise.
 
 **Sources.** `git` compares the working tree against `gitRev`; `session` reads the
 newest `workspace/changes` record the Host still serves for this session; `auto`
 (default) tries git and falls back to the record. The record lives in the Host
 process only, so after a restart only git can still see the work.
 
+**Review tools.** `append_finding`, `update_finding`, `delete_finding`,
+`list_findings`, `set_summary` and `finish_review`, offered on every call of
+every run. `append_finding` and `update_finding` take exactly the finding shape
+the mode in force declares — its severity ids as an enum, its fields with their
+guides as descriptions — because that shape is what the report reads. The set of
+names is fixed: no setting adds, removes or renames one, and a mode's `settings`
+block is a preset of run settings that cannot touch them either. A call the store
+cannot use changes nothing and answers with everything that was wrong with it, so
+the reviewer can fix it and call again.
+
+**Partial runs.** A run that stops before `finish_review` — a broken stream, a
+provider failure, a timeout, a cancel, a model that will not finish — hands over
+every finding already recorded, marked **incomplete** with the reason, in the
+card, the report and the agent notice. Nothing that was recorded is lost and
+nothing is kept anywhere else. A run that recorded no finding at all is not a
+report: it fails with the reason instead of showing an empty pass.
+
 **Evidence gate.** The reviewer must quote the line that proves each finding; a
 quote that does not occur in the diff or in what the reader tools returned is
-discarded and the finding with it. The fields a finding must state come from the
+withheld, and the finding with it. The fields a finding must state come from the
 mode: `cr` asks for the impact and the route that reaches the defect, `arc` for
 the consequence and the alternative it proposes, a mode you wrote for whatever it
 declared. Anything that fails is **withheld**, never silently dropped: the count
@@ -230,8 +267,11 @@ plugin. No command, no shell, no write, no network. Paths are resolved to their
 real target and must stay inside the workspace, so a symlink cannot be used to
 read outside it, and the ignore rules of the run apply to them as well. Reading is
 bounded by `maxToolCalls`, `maxReadBytes`, `maxSearchResults` and
-`toolDeadlineRatio`; when a bound is reached the reviewer is told and must answer.
-Set `projectAccess: false` for a diff-only review.
+`toolDeadlineRatio`; when a bound is reached the reader tools are withdrawn, the
+reviewer is told, and the review tools stay — a review always has somewhere to go.
+The contract the run opens with is written from the same answer as that tool list,
+so a run offered no reader tool is never told it has three. Set
+`projectAccess: false` for a diff-only review.
 
 ## Configuration
 
@@ -290,15 +330,15 @@ command surface.
 | `language` | Report language. Empty mirrors the focus message; with no focus message the report is English. |
 | `source`, `gitRev` | Where the change set comes from and what git compares against. |
 | `notifyAgent` | `off` (default): only you see the report. `steer` hands it to the agent as a notice, which starts a turn; `inject` puts it in the agent's context without starting one. Set one of those only if you want the agent in the loop. |
-| `projectAccess` | Give the reviewer the read-only tools above. |
-| `maxToolCalls`, `maxReadBytes`, `maxSearchResults`, `toolDeadlineRatio` | Reader budgets. |
+| `projectAccess` | Give the reviewer the read-only tools above. The six review tools are always offered: this key never removes one. |
+| `maxToolCalls`, `maxReadBytes`, `maxSearchResults`, `toolDeadlineRatio` | Reader budgets. They bound the read-only tools only — never `append_finding` or the other review tools. |
 | `maxFiles`, `maxDiffChars` | Reviewed files and total diff size; the rest are listed as left out. |
 | `maxHintChars` | Cap on the focus message you type. |
 | `ignored` | Extra ignore patterns (an array, or one string with commas or newlines between them), on top of the built-in standard list. Prefix a pattern with `!` to put a path back. |
 | `ignoreDefaults` | `true` (default): the built-in standard list applies. `false` reviews dependency trees and build output like anything else. |
 | `respectGitIgnore` | `true` (default): the repository's own ignore rules are honored too, tracked files included. `false` reviews them. |
-| `maxTokens`, `temperature`, `timeoutMs` | Output cap, sampling and the budget for the whole run. A first call that fails is retried once without project access and with the output cap lowered to 8192 or to the configured value when that is smaller; the report says the run was degraded. |
-| `reasoningEffort` | The thinking level handed to the reviewer, as the adapter names it — `off`, `low`, `high`, `max` on DeepSeek. Empty (the default) sends no level, so the provider's own default decides; that is what every run did before this key existed. A mode can preset it (`modes.cr.settings.reasoningEffort`) and `reasoningEffort=` on the command line beats them both. A level the selected model does not offer is refused before any model call, and the offered levels are listed. |
+| `maxTokens`, `temperature`, `timeoutMs` | Output cap, sampling and the budget for the whole run. A first call that fails is retried once with project access dropped and the output cap lowered to 8192 or to the configured value when that is smaller — the review tools stay, because without them there is no review to record. The report says the run was degraded. |
+| `reasoningEffort` | The thinking level handed to the reviewer, as the adapter names it — `off`, `low`, `high`, `max` on DeepSeek. Empty (the default) sends no level, so the provider's own default decides. A mode can preset it (`modes.cr.settings.reasoningEffort`) and `reasoningEffort=` on the command line beats them both. A level the selected model does not offer is refused before any model call, and the offered levels are listed. |
 
 `modes` is the one key the file holds that the table above does not list: an
 object of mode entries, documented under [Modes](#modes), with the built-in modes
@@ -327,11 +367,29 @@ that ran; `cr`'s are `correctness`, `concurrency`, `error-handling`, `security`,
 
 A file that is binary, oversized or over a budget is reported as **left out**, and
 a file the ignore rules cover is reported as **excluded as ignored** with the rule
-that matched — neither is ever silently dropped. Output that cannot be parsed
-fails loudly with the raw text instead of reporting a fake pass.
+that matched — neither is ever silently dropped. A call the store cannot use is
+refused with the reason and changes nothing; a finding the gate cannot publish is
+recorded as **withheld** and named with its reason; a run that recorded nothing
+before it stopped fails loudly instead of reporting a fake pass. Every run's store
+activity is in the report — how many calls it took, how many findings were
+recorded, updated and deleted.
 
 ## Limits
 
+- One run is bounded by the reader budgets, by `timeoutMs`, and by the plugin's
+  own limits — 100 findings in the store, 300 finding-tool calls, 150 model turns
+  and two nudges to finish. None of them is a setting: they are the bounds that
+  keep a review recordable and a run finite.
+- A bound never loses what was recorded; it changes what the reviewer can still
+  do, and the report names the one it was. The reader tools are withdrawn when
+  the reading budget is spent, and the review tools stay. Past 300 finding-tool
+  calls the store takes no more changes — the reviewer can still list what it has,
+  record its summary and close the review — and that review is marked incomplete
+  with the cap named. A run that ran out of turns or stopped without finishing is
+  marked incomplete for that reason, and a run that recorded nothing at all fails
+  instead of showing an empty pass.
+- The store lives in the Host process, so a restart loses the run in progress —
+  what survives is every run that finished, in the card.
 - The reviewer reads the workspace but cannot run anything, so build and test
   results stay outside its reach by construction.
 - Files changed by a shell command cannot be attributed to the session; they show

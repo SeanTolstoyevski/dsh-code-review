@@ -29,9 +29,8 @@ window.__ModuleLoader__.load({
 
     /**
      * What the card draws when a payload does not describe its mode — a payload
-     * from another release, or the raw fallback face. It carries the code-review
-     * vocabulary the plugin shipped before modes, labels included, so the card
-     * never shows a blank finding.
+     * that was truncated, or the raw fallback face. It carries the code-review
+     * vocabulary, labels included, so the card never shows a blank finding.
      */
     const DEFAULT_MODE = {
       id: 'cr',
@@ -56,10 +55,12 @@ window.__ModuleLoader__.load({
       'title': 'Code review',
       'state.running': 'Reviewing the change set…',
       'state.error': 'The review did not complete',
+      'state.partial': 'incomplete',
       'label.findings': 'Findings',
       'label.skipped': 'Left out of the review',
       'label.ignored': 'Excluded by the ignore rules',
       'label.withheld': 'Withheld as unprovable',
+      'label.incomplete': 'This review stopped early',
       'label.reviewer': 'reviewer',
       'label.thinking': 'thinking',
       'empty.findings': 'No proven findings — nothing here stands up as worth reporting.',
@@ -85,10 +86,12 @@ window.__ModuleLoader__.load({
       'title': '代码审核',
       'state.running': '正在审核本次改动…',
       'state.error': '审核未能完成',
+      'state.partial': '未完成',
       'label.findings': '问题清单',
       'label.skipped': '未纳入审核',
       'label.ignored': '被忽略规则排除',
       'label.withheld': '因无法证实而扣留',
+      'label.incomplete': '本次审核提前结束',
       'label.reviewer': '审核模型',
       'label.thinking': '思考等级',
       'empty.findings': '没有可证实的发现——这里没有值得报告的问题。',
@@ -501,18 +504,29 @@ window.__ModuleLoader__.load({
       // code review, `decide before merge` for an architecture review — while the
       // tone stays the machine verdict, so the card reads the same at a glance.
       const verdictLabel = payload.mode?.verdict?.label ?? mode.verdicts[payload.verdict] ?? payload.verdict ?? 'pass'
+      // A review the run stopped early still reaches the reader — with the reason
+      // it is short, so nobody reads a partial list as a complete answer.
+      const incomplete = typeof payload.incomplete === 'string' && payload.incomplete !== ''
+        ? payload.incomplete
+        : undefined
 
       return h('div', { className: 'dcr-card' }, [
         h('style', { key: 'css' }, CSS),
         head(
           mode.label,
-          [chip(String(verdictLabel), toneOf(payload.verdict), 'verdict')],
+          [
+            chip(String(verdictLabel), toneOf(payload.verdict), 'verdict'),
+            ...(incomplete === undefined ? [] : [chip(t('state.partial'), 'warn', 'partial')]),
+          ],
           [
             h(CopyButton, { key: 'copy', text: reportOf(outcome.text), label: 'action.copyReport', t }),
             toggle,
           ],
         ),
         h('div', { className: 'dcr-meta', key: 'meta' }, subtitle),
+        incomplete === undefined
+          ? null
+          : h('div', { className: 'dcr-meta', key: 'incomplete' }, `${t('label.incomplete')}: ${incomplete}`),
         open ? h('div', { key: 'body' }, [
           payload.summary
             ? h('div', { className: 'dcr-summary', key: 'summary' }, payload.summary)
