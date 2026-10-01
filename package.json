@@ -17,6 +17,7 @@
     "cordis.patch.yml",
     "icon.svg",
     "selftest.mjs",
+    "docs",
     "README.md"
   ],
   "dsh": {

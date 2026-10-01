@@ -1,22 +1,7 @@
 /**
- * dsh-code-review — Client half.
- *
- * Draws the report the Host half returns, as the renderer for the `review`
- * command row. It fetches nothing and owns no state: everything it shows
- * arrives in the command node's `outcome.text`, as a Markdown report followed by
- * one fenced JSON payload after `<!-- code-review:payload -->`. A card that
- * cannot parse the payload falls back to the raw report text.
- *
- * The card is mode-agnostic: the Host half sends the mode's label, its severity
- * vocabulary and the ordered field list of one finding, and the card draws what
- * it was sent. It knows no particular mode, so a mode a user wrote under `modes`
- * in `config.json` renders exactly like `cr` or `arc` does.
- *
- * The card is where the review is read and taken away. It renders the report and
- * offers a copy action — the whole report, or one finding — and nothing else: no
- * button sends anything to the agent, because a review is a decision aid and the
- * decision, with the instruction that follows from it, belongs to the human.
- * The report never reaches the agent by itself either; see `notifyAgent`.
+ * dsh-code-review — Client half: draws the report the Host half returns in `outcome.text` (Markdown plus one fenced
+ * JSON payload after the marker), from the mode's own labels and field list, so the card knows no particular mode.
+ * It offers copy actions only: a review is a decision aid, and the instruction that follows it belongs to the human.
  */
 window.__ModuleLoader__.load({
   id: '@local/dsh-code-review',
@@ -27,11 +12,7 @@ window.__ModuleLoader__.load({
     const NS = 'code-review'
     const MARKER = '<!-- code-review:payload -->'
 
-    /**
-     * What the card draws when a payload does not describe its mode — a payload
-     * that was truncated, or the raw fallback face. It carries the code-review
-     * vocabulary, labels included, so the card never shows a blank finding.
-     */
+    /** What the card draws when a payload does not describe its mode — a truncated payload, or the raw fallback face — so a finding is never blank. */
     const DEFAULT_MODE = {
       id: 'cr',
       label: 'Code review',
@@ -173,9 +154,8 @@ window.__ModuleLoader__.load({
       const fence = rest.indexOf('```json')
       if (fence < 0) return undefined
       const body = rest.slice(fence + '```json'.length)
-      // The payload is the last block of the report and its own fields may
-      // contain a fence (an evidence quote from a Markdown file, for instance),
-      // so the closing fence is the last one.
+      // The payload is the report's last block and its own fields may contain a fence (an evidence quote from a
+      // Markdown file), so the closing fence is the last one.
       const end = body.lastIndexOf('```')
       if (end < 0) return undefined
       try {
@@ -186,11 +166,8 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /**
-     * Which face the card shows for one command outcome, and the payload behind
-     * it. A command that succeeded but whose payload did not parse is `unparsed`,
-     * not `error`: the review did run, and saying otherwise is a lie.
-     */
+    /** Which face the card shows for one outcome, and the payload behind it. A run that succeeded but whose payload
+     * did not parse is `unparsed`, not `error`: the review did run, and saying otherwise is a lie. */
     function readOutcome(outcome) {
       if (outcome === null || outcome === undefined) return { face: 'running', payload: undefined }
       if (outcome.kind !== 'success') return { face: 'error', payload: undefined }
@@ -200,25 +177,18 @@ window.__ModuleLoader__.load({
         : { face: 'report', payload }
     }
 
-    /** The Markdown report without the machine payload that follows it. */
     function reportOf(text) {
       if (typeof text !== 'string') return ''
       const marker = text.indexOf(MARKER)
       return (marker < 0 ? text : text.slice(0, marker)).trimEnd()
     }
 
-    /** `file:line` of one finding, or an empty string when it names no file. */
     function whereOf(finding) {
       const file = typeof finding?.file === 'string' ? finding.file : ''
       if (file === '') return ''
       return `${file}${Number.isInteger(finding?.line) ? `:${finding.line}` : ''}`
     }
 
-    /**
-     * The mode a payload describes: the fields, their labels and the severity
-     * vocabulary the Host half sent with the report. The card knows nothing about
-     * any particular mode, so a mode a user wrote renders like a built-in one.
-     */
     function modeOf(payload) {
       const mode = payload?.mode
       if (mode === null || typeof mode !== 'object' || !Array.isArray(mode.fields)) return DEFAULT_MODE
@@ -233,7 +203,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** How one severity is named and toned, for the chip and the withheld list. */
     function severityOf(mode, id) {
       const found = mode.severities.find(entry => entry.id === id)
       if (found !== undefined) {
@@ -242,11 +211,7 @@ window.__ModuleLoader__.load({
       return { id, label: typeof id === 'string' ? id : '?', tone: 'muted' }
     }
 
-    /**
-     * One finding as the report itself words it, so a copy pastes cleanly
-     * elsewhere. The body is the mode's own field list, in its order: a `block`
-     * field is fenced, an empty label renders the text bare.
-     */
+    /** One finding as the report itself words it — the mode's own field list in its order — so a copy pastes cleanly elsewhere. */
     function findingText(finding, index, mode = DEFAULT_MODE) {
       const where = whereOf(finding)
       const severity = severityOf(mode, finding?.severity)
@@ -266,7 +231,6 @@ window.__ModuleLoader__.load({
       return lines.join('\n')
     }
 
-    /** Clipboard write, with the selection fallback for a context without the async API. */
     async function copyText(text) {
       try {
         if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText !== undefined) {
@@ -328,11 +292,7 @@ window.__ModuleLoader__.load({
       return parts.join(' · ')
     }
 
-    /**
-     * A button that puts `text` on the clipboard and reports the outcome for a
-     * moment. The timer lives in a state-initialized box so no extra hook is
-     * needed, and a failed copy says so instead of silently doing nothing.
-     */
+    /** Puts `text` on the clipboard and reports the outcome for a moment; the timer lives in a state box, so no extra hook, and a failed copy says so. */
     function CopyButton({ text, label, t }) {
       const [state, setState] = React.useState('idle')
       const [box] = React.useState(() => ({ timer: null }))
@@ -352,11 +312,6 @@ window.__ModuleLoader__.load({
       }, t(shown))
     }
 
-    /**
-     * The row under one finding. It copies and nothing else: a review is a
-     * decision aid, and the decision — and the instruction that follows from it —
-     * belongs to the human, who hands it to the agent in their own words.
-     */
     function findingActions(finding, index, t, mode) {
       return h('div', { className: 'dcr-actions', key: 'actions' }, [
         h(CopyButton, {
@@ -369,11 +324,6 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    /**
-     * One finding, drawn from the field list its mode declared: the chip is the
-     * mode's name for the severity, the body is the mode's fields in the mode's
-     * order, and a field the mode marked `block` is quoted code.
-     */
     function findingRow(finding, index, t, mode) {
       const where = whereOf(finding)
       const severity = severityOf(mode, finding.severity)
@@ -420,11 +370,8 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    /**
-     * What the ignore rules took out of the change set, with the rule that took
-     * it. The count is the truth and the list is a sample, so a report never
-     * grows a dependency tree it was asked to leave out.
-     */
+    /** What the ignore rules took out of the change set, with the rule that took it. The count is the truth
+     * and the list is a sample, so a report never grows the dependency tree it was asked to leave out. */
     function ignoredList(ignore, t) {
       const sample = Array.isArray(ignore?.sample) ? ignore.sample : []
       if (sample.length === 0) return null
@@ -494,18 +441,15 @@ window.__ModuleLoader__.load({
       const findings = Array.isArray(payload.findings) ? payload.findings : []
       const mode = modeOf(payload)
       const reviewer = payload.reviewer
-      // The level is shown only when the run asked for one: a review that left
-      // the choice to the provider says nothing rather than claiming a level.
+      // The level is shown only when the run asked for one: a review that left the choice to the provider says nothing rather than claiming a level.
       const thinking = typeof reviewer?.reasoningEffort === 'string' && reviewer.reasoningEffort !== ''
         ? ` · ${t('label.thinking')} ${reviewer.reasoningEffort}`
         : ''
       const subtitle = `${countLine(payload, t, mode)}${reviewer ? ` · ${t('label.reviewer')} ${reviewer.provider}/${reviewer.model}${thinking}` : ''}`
-      // The verdict chip says the mode's own word for the answer — `fail` for a
-      // code review, `decide before merge` for an architecture review — while the
-      // tone stays the machine verdict, so the card reads the same at a glance.
+      // The verdict chip says the mode's own word for the answer — `fail` for a code review, `decide before merge`
+      // for an architecture review — while the tone stays the machine verdict, so the card reads the same at a glance.
       const verdictLabel = payload.mode?.verdict?.label ?? mode.verdicts[payload.verdict] ?? payload.verdict ?? 'pass'
-      // A review the run stopped early still reaches the reader — with the reason
-      // it is short, so nobody reads a partial list as a complete answer.
+      // A review the run stopped early still reaches the reader, with the reason it is short, so nobody reads a partial list as a complete answer.
       const incomplete = typeof payload.incomplete === 'string' && payload.incomplete !== ''
         ? payload.incomplete
         : undefined

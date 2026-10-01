@@ -1,21 +1,11 @@
 /**
- * Self-test for both halves: drives the `/review` handler against a fake Context
- * and asserts the whole path — diff collection, the read-only project reader
- * (tools, budget, sandbox), the evidence gate, the modes and the settings file,
- * the notice that reaches the Agent when it is opted in, and every failure mode.
- * It then loads the Client artifact and asserts the card's copy helpers, its
- * mode-driven body and its outcome faces.
- *
- * The reviewer model is scripted: each entry answers one model call, either with
- * text or with tool calls, so the loop is exercised without a network call.
- *
- * Run: node selftest.mjs
+ * Self-test for both halves — the `/review` path against a stub Context, then the loaded Client card. Run: node selftest.mjs
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { apply, BUILT_IN_MODES, DEFAULTS } from './index.js'
 
@@ -24,9 +14,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const SESSION = 'session-under-test'
 const MARKER = '<!-- code-review:payload -->'
 
-// Hermetic by construction: the run must never read the developer's real
-// DSH_HOME/code-review/config.json, or the settings on this machine would decide
-// what the assertions mean. `withSettings` layers a per-test file on top.
+// Hermetic: the run must never read the developer's real DSH_HOME/code-review/config.json, or this machine's settings would decide what the assertions mean.
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-code-review-home-'))
 
 // A real workspace, because the reader tools touch the filesystem.
@@ -62,27 +50,16 @@ writeFileSync(
 const READ_ONLY_LINE = 'b.Reset() // MARKER_NIL_SQUARES'
 const READ_ONLY_FILE = 'internal/play/move.go'
 
-/**
- * A Context stub exposing only what the plugin body touches.
- * @param options.summary - what `workspaceChanges.summary` returns.
- * @param options.summaries - per-seq summaries instead, so a dropped record can be simulated.
- * @param options.events - the recorded `workspace/changes` seqs in log order (oldest first).
- * @param options.diffs - what `workspaceChanges.diff` returns, by file index.
- * @param options.script - one entry per model call: `{ text }` or `{ toolCalls }`; the last entry repeats.
- * @param options.hasEvent - whether the session recorded a `workspace/changes` event.
- * @param options.route - the agent's own route, as real Agents expose it; `{}` means no route is known.
- * @param options.steerThrows - makes `agent.steer` reject, to prove the report survives.
- * @param options.failAtCall - makes that 1-based model call throw, as a broken stream does;
- *   an array makes every call in it fail, which is how "the retry fails too" is scripted.
- * @param options.failWith - the message that call fails with.
- * @param options.abortAtCall - makes that 1-based model call abort the command signal and throw.
- * @param options.git - expose a real `ctx.subprocess`, so the git source can run.
- * @param options.cwd - the session workspace the plugin reads.
- * @param options.messages - what the session derives as its conversation.
- * @param options.toolCalls - `{ name, arguments }` entries logged as this session's tool calls.
- * @param options.modelInfo - what `ctx.llm.resolveModelInfo` returns; omitted exposes no such method.
- * @param options.modelInfoThrows - makes `resolveModelInfo` reject, as an unregistered route does.
- */
+/** A Context stub exposing only what the plugin body touches; `script` answers one model call per entry, its last repeating.
+ * `failAtCall` and `abortAtCall` are 1-based, and `failAtCall` may name a list of calls to fail.
+ * `toolService: false` exposes no harness tool service at all, while `toolNames` decides which of the harness's
+ * `read`/`grep` it exposes. `readFails`/`grepFails` make that tool fail — a message or `true` for an error result,
+ * `{ throws: message }` for a call that throws instead; `readLimit` caps the window `read` accepts, so a call asking
+ * for more is refused while a call without a `limit` is served; `readMalformed`/`grepMalformed` make a call that
+ * succeeds answer with a `value` the wrapper does not declare (`'lines'`/`'text'`/`'totalLines'` for `read`,
+ * `'matches'`/`'row'` for `grep`, `true` meaning the first); `readPath: 'relative'` makes `read` report a relative
+ * `value.path`, where the real backend reports the absolute spelling it resolved; `abortOnTool` cancels the command
+ * while a tool is running, which is a cancel landing mid-read. */
 function harness({
   summary,
   summaries,
@@ -101,15 +78,37 @@ function harness({
   toolCalls = [],
   modelInfo,
   modelInfoThrows = false,
+  toolService = true,
+  toolNames = ['read', 'grep'],
+  readFails = false,
+  grepFails = false,
+  readLimit,
+  readMalformed = false,
+  grepMalformed = false,
+  readPath = 'absolute',
+  abortOnTool = false,
 }) {
   const subprocess = git ? realSubprocess() : undefined
   const seen = { prompts: [], steer: [], inject: [], steerAttempts: 0, modelInfo: [] }
   const controller = new AbortController()
+  const tools = fakeToolService(cwd, {
+    names: toolNames,
+    readFails,
+    grepFails,
+    readLimit,
+    readMalformed,
+    grepMalformed,
+    readPath,
+    onCall: () => { if (abortOnTool) controller.abort() },
+  })
   let definition
   let call = 0
   const ctx = {
     effect(callback) { callback() },
-    get(name) { return name === 'subprocess' ? subprocess : undefined },
+    get(name) {
+      if (name === 'subprocess') return subprocess
+      return name === 'tools' && toolService ? tools : undefined
+    },
     commands: { register(value) { definition = value; return () => {} } },
     workspaceChanges: {
       summary: (_id, seq) => (summaries === undefined ? summary : summaries[seq]),
@@ -124,9 +123,8 @@ function harness({
         },
       },
       stream(request) {
-        // The messages array is live and keeps growing; each recorded request
-        // keeps the list as it was sent, so an assertion about one call means
-        // what that call actually saw.
+        // Each recorded request keeps the message list as it was sent, so an assertion about one call
+        // means what that call actually saw.
         seen.prompts.push({ ...request, messages: [...request.messages] })
         const step = script[Math.min(call, script.length - 1)]
         call += 1
@@ -185,13 +183,9 @@ function harness({
   const invoke = rawInput => definition.handler({
     commandId: 'c1', agent, rawInput, attachments: [], signal: controller.signal,
   })
-  return { invoke, seen, name: definition.name, definition }
+  return { invoke, seen, name: definition.name, definition, tools }
 }
 
-/**
- * The `ctx.subprocess` face the plugin uses, backed by a real child process so
- * the git source is exercised against real repositories and real output.
- */
 function realSubprocess() {
   const reader = text => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
   return {
@@ -219,12 +213,173 @@ function realSubprocess() {
   }
 }
 
-/** `DSH_HOME/code-review/config.json` for a harness home a test created. */
+/**
+ * The harness's own `read` and `grep`, over the real workspace, shaped like the
+ * results the plugin's wrappers are written against: a failure is an `isError`
+ * result whose first text block carries the message, a success carries the
+ * `value` the wrapper reads. Faithful where it matters — the window is 1-based
+ * and numbered, `totalLines` is the whole file, `read` reports the absolute path
+ * it resolved, grep takes a regular expression and skips binary files, and a path
+ * outside the workspace, a directory, a binary file and a missing file are
+ * refused rather than read — and every call is recorded so a test can prove what
+ * reached the harness and what never did. `readFails`/`grepFails` break one tool
+ * (`{ throws: message }` throws instead of returning the error result), `readLimit`
+ * is the window `read` accepts at most (a larger `limit` is refused; a call that
+ * sends no `limit` is served the deployment's own default), `readMalformed` and
+ * `grepMalformed` turn a success into a `value` the wrapper cannot read, and
+ * `onCall` runs just before each call is served.
+ */
+function fakeToolService(workspace, { names = ['read', 'grep'], readFails = false, grepFails = false, readLimit, readMalformed = false, grepMalformed = false, readPath = 'absolute', onCall } = {}) {
+  const calls = []
+  let root = resolve(workspace)
+  try {
+    root = realpathSync(root)
+  } catch {
+    // A workspace that does not exist yet is still a boundary; the lexical root names it.
+  }
+  const failure = message => ({ isError: true, error: { message }, content: [{ type: 'text', text: `Error: ${message}` }] })
+  const shown = path => relative(root, path).replace(/\\/g, '/')
+  const escapes = path => {
+    const lexical = relative(root, resolve(root, path))
+    if (lexical !== '' && (lexical.startsWith('..') || isAbsolute(lexical))) return true
+    try {
+      const physical = relative(root, realpathSync(resolve(root, path)))
+      return physical !== '' && (physical.startsWith('..') || isAbsolute(physical))
+    } catch {
+      return false
+    }
+  }
+  function read(args) {
+    const requested = String(args.file_path ?? '')
+    if (requested.trim() === '') return failure('file_path must be a non-empty string')
+    const target = resolve(root, requested)
+    if (escapes(target)) return failure(`"${requested}" is outside the workspace`)
+    let stat
+    try {
+      stat = statSync(target)
+    } catch {
+      return failure(`cannot read "${shown(target)}": not found`)
+    }
+    if (!stat.isFile()) return failure(`cannot read "${shown(target)}": not a regular file`)
+    let content
+    try {
+      content = readFileSync(target, 'utf8')
+    } catch (error) {
+      return failure(`cannot read "${shown(target)}": ${error?.code ?? String(error)}`)
+    }
+    if (content.includes('\u0000')) return failure(`cannot read "${shown(target)}": binary file`)
+    const raw = content.split('\n')
+    const fileLines = (raw.at(-1) === '' ? raw.slice(0, -1) : raw).map(line => (line.endsWith('\r') ? line.slice(0, -1) : line))
+    const offset = Number.isInteger(args.offset) && args.offset > 0 ? args.offset : 1
+    // A deployment may cap the window it reads without publishing the cap among the tool's
+    // parameters: asking for more is the refusal the review retries without a `limit`.
+    if (readLimit !== undefined && Number.isInteger(args.limit) && args.limit > readLimit) {
+      return failure(`"limit" ${args.limit} is over the ${readLimit} lines this harness reads at most`)
+    }
+    const asked = Number.isInteger(args.limit) && args.limit > 0 ? args.limit : (readLimit ?? 2000)
+    const limit = readLimit === undefined ? asked : Math.min(asked, readLimit)
+    if (offset > fileLines.length && !(fileLines.length === 0 && offset === 1)) {
+      return failure(`offset ${offset} is out of range for "${shown(target)}" (${fileLines.length} lines)`)
+    }
+    const lines = fileLines.slice(offset - 1, offset - 1 + limit).map((text, index) => ({ number: offset + index, text }))
+    // The real `read` reports the path its backend resolved, which is absolute for the absolute `file_path` the wrapper sends.
+    const reported = readPath === 'relative' ? shown(target) : target
+    if (readMalformed !== false) {
+      const shape = readMalformed === true ? 'lines' : readMalformed
+      const values = {
+        lines: { path: reported, offset, lines: `${lines.length} line(s)`, totalLines: fileLines.length },
+        text: { path: reported, offset, lines: lines.map(line => ({ number: line.number, text: line.number })), totalLines: fileLines.length },
+        totalLines: { path: reported, offset, lines, totalLines: String(fileLines.length) },
+      }
+      return { isError: false, value: values[shape], content: [{ type: 'text', text: '[the harness answered with a shape it does not declare]' }] }
+    }
+    return {
+      isError: false,
+      value: { path: reported, offset, lines, totalLines: fileLines.length },
+      content: [{ type: 'text', text: lines.map(line => `${line.number}: ${line.text}`).join('\n') }],
+    }
+  }
+
+  function grep(args, signal) {
+    let pattern
+    try {
+      pattern = new RegExp(String(args.pattern ?? ''))
+    } catch (error) {
+      return failure(`regex parse error: ${error.message}`)
+    }
+    const where = String(args.path ?? '')
+    const base = where.trim() === '' ? root : resolve(root, where)
+    if (escapes(base)) return failure(`"${where}" is outside the workspace`)
+    const matches = []
+    const walk = directory => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        signal?.throwIfAborted?.()
+        const path = join(directory, entry.name)
+        if (entry.isDirectory()) {
+          walk(path)
+          continue
+        }
+        if (!entry.isFile()) continue
+        let content
+        try {
+          content = readFileSync(path, 'utf8')
+        } catch {
+          continue
+        }
+        // ripgrep searches text and leaves binary files alone.
+        if (content.includes('\u0000')) continue
+        for (const [index, line] of content.split('\n').entries()) {
+          const text = line.endsWith('\r') ? line.slice(0, -1) : line
+          if (pattern.test(text)) matches.push({ path: shown(path), lineNumber: index + 1, line: text })
+        }
+      }
+    }
+    try {
+      walk(base)
+    } catch (error) {
+      return failure(`cannot search "${shown(base)}": ${error?.code ?? String(error)}`)
+    }
+    if (grepMalformed !== false) {
+      const shape = grepMalformed === true ? 'matches' : grepMalformed
+      const values = {
+        matches: { matches: `${matches.length} match(es)` },
+        row: { matches: matches.map(match => ({ path: match.path, line: match.line })) },
+      }
+      return { isError: false, value: values[shape], content: [{ type: 'text', text: '[the harness answered with a shape it does not declare]' }] }
+    }
+    return {
+      isError: false,
+      value: { matches },
+      content: [{ type: 'text', text: matches.map(match => `${match.path}:${match.lineNumber}: ${match.line}`).join('\n') }],
+    }
+  }
+
+  return {
+    calls,
+    get(name) {
+      return names.includes(name) ? { name, description: `the harness's ${name} tool` } : undefined
+    },
+    async execute({ name, arguments: args, signal }) {
+      calls.push({ name, arguments: args })
+      onCall?.(name)
+      signal?.throwIfAborted?.()
+      const broken = name === 'read' ? readFails : name === 'grep' ? grepFails : false
+      if (broken !== false) {
+        const message = typeof broken === 'string' ? broken : `the ${name} tool failed`
+        if (typeof broken === 'object' && broken !== null) throw new Error(typeof broken.throws === 'string' ? broken.throws : message)
+        return failure(message)
+      }
+      if (name === 'read') return read(args ?? {})
+      if (name === 'grep') return grep(args ?? {}, signal)
+      return failure(`no tool named "${name}" is available to this run`)
+    },
+  }
+}
+
 function settingsPath(home) {
   return join(home, 'code-review', 'config.json')
 }
 
-/** Run `fn` with `DSH_HOME` pointed at `home`, restoring the previous value after. */
 async function withDshHome(home, fn) {
   const previous = process.env.DSH_HOME
   process.env.DSH_HOME = home
@@ -236,7 +391,6 @@ async function withDshHome(home, fn) {
   }
 }
 
-/** Run `fn` with `DSH_HOME` pointed at a fresh directory holding this config. */
 async function withSettings(settings, fn) {
   const home = mkdtempSync(join(tmpdir(), 'dsh-code-review-home-'))
   mkdirSync(join(home, 'code-review'), { recursive: true })
@@ -244,12 +398,10 @@ async function withSettings(settings, fn) {
   return withDshHome(home, fn)
 }
 
-/** Run `fn` with `DSH_HOME` pointed at a fresh directory that holds no settings file at all. */
 async function withEmptyHome(fn) {
   return withDshHome(mkdtempSync(join(tmpdir(), 'dsh-code-review-home-')), fn)
 }
 
-/** Run `fn` with `console.warn` collected; every plugin diagnostic goes through it. */
 async function captureWarnings(fn) {
   const warnings = []
   const original = console.warn
@@ -261,7 +413,6 @@ async function captureWarnings(fn) {
   }
 }
 
-/** The payload the Client half parses out of the report text. */
 function payloadOf(text) {
   const marker = text.indexOf(MARKER)
   assert.ok(marker >= 0, 'report carries the payload marker')
@@ -269,25 +420,27 @@ function payloadOf(text) {
   return JSON.parse(body.slice(0, body.indexOf('```')))
 }
 
-/** Messages of one model call, by role. */
 function messagesOf(request, role) {
   return request.messages.filter(message => message.role === role)
 }
 
-/**
- * Whether one model call was handed the read-only project tools, and whether its
- * contract claims them. The two are one decision — the run's reading bound — so
- * every test that checks one checks the other against it here, and a run that
- * describes itself as able to read while offering nothing to read it with fails.
- */
+/** The reader tools the contract's reading section names, in its own order, or none when it says this run cannot read. */
+function readersInContract(system) {
+  if (system.includes('This run cannot read the project')) return []
+  const match = /You have (?:one|two|three|\d+) read-only tools?: ([^.]+)\./.exec(system)
+  assert.ok(match !== null, 'the contract carries a reading section')
+  return match[1].replace(' and ', ', ').split(', ')
+}
+
+// A call's contract and its tool list are one decision: the tools the contract names are exactly the reader tools the request offers, so a run is never described as one it is not.
 function assertOneReading(request, what) {
-  const offered = request.tools.some(tool => READER_TOOL_NAMES.includes(tool.name))
-  assert.equal(
-    request.system.includes('You have three read-only tools'),
+  const offered = request.tools.filter(tool => READER_TOOL_NAMES.includes(tool.name)).map(tool => tool.name)
+  assert.deepEqual(
+    readersInContract(request.system),
     offered,
     `the contract and the tool list describe one run (${what})`,
   )
-  return offered
+  return offered.length > 0
 }
 
 const TEXT_DIFF = {
@@ -311,7 +464,6 @@ const PROVEN = {
   trigger: 'A game replayed from a PGN whose last move is incomplete reaches ApplyMove with a nil board.',
   evidence: '+new',
 }
-/** The same proof, in the vocabulary the architecture mode declares. */
 const ARC_FINDING = {
   severity: 'high', category: 'responsibility', file: 'internal/chessx/board.go', line: 13,
   title: 'Move the reset out of Apply', problem: 'Apply resets a board it does not own',
@@ -319,15 +471,10 @@ const ARC_FINDING = {
   alternative: 'Let the caller reset the board before Apply is called.',
   evidence: '+new',
 }
-/** One tool call as the model would make it. */
 const toolCall = (name, args) => ({ name, arguments: JSON.stringify(args ?? {}) })
 
-/**
- * One model turn: record these findings, record the summary, finish the review.
- * That is the whole protocol in one turn and it is what most tests need.
- * `summary: null` records none, and `finish: false` leaves the review open —
- * which is how a model that stops mid-review, or never finishes, is scripted.
- */
+// One model turn: record these findings, record the summary, finish the review. `summary: null`
+// records none, and `finish: false` leaves the review open — how a model that stops mid-review is scripted.
 const record = (findings = [], summary = 'x', { finish = true, more = [] } = {}) => ({
   toolCalls: [
     ...findings.map(finding => toolCall('append_finding', finding)),
@@ -337,16 +484,11 @@ const record = (findings = [], summary = 'x', { finish = true, more = [] } = {})
   ],
 })
 
-/**
- * The review tools every run offers, in the order it offers them. They are the
- * protocol — the report is built from what they store — so the tests assert the
- * same six names under every setting, mode and command line.
- */
+// The review tools every run offers, in the order it offers them: the protocol the report is built from.
 const REVIEW_TOOL_NAMES = ['append_finding', 'update_finding', 'delete_finding', 'list_findings', 'set_summary', 'finish_review']
 const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
 
-// 1 — a proven finding survives the gate and reaches both the report and the
-// payload, in the default mode's own vocabulary.
+// 1 — a proven finding survives the gate and reaches both the report and the payload.
 {
   const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([PROVEN], 'Nil board.')] })
   assert.equal(h.name, 'review')
@@ -390,9 +532,7 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   assert.ok(result.text.includes('- finding store: 3 tool call(s), 1 recorded, 0 updated, 0 deleted'), 'the report names the store')
 }
 
-// 2 — the verdict is computed from the store, never declared: a finding that
-// cannot name itself takes its title from the first field it did state, and a
-// model that tries to hand over a verdict is told there is no such field.
+// 2 — the verdict is computed from the store, never declared; a finding that cannot name itself takes its title from the first field it stated.
 {
   const h = harness({
     summary: SUMMARY,
@@ -417,8 +557,7 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   assert.ok(refusals[0].content[0].text.includes('takes no arguments'), refusals[0].content[0].text)
 }
 
-// 3 — a reviewer that records nothing and never finishes has no review to show:
-// it is an error, never a report that looks like a pass.
+// 3 — a reviewer that records nothing and never finishes is an error, never a report that looks like a pass.
 {
   const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [{ text: 'Looks fine to me!' }] })
   const result = await h.invoke('')
@@ -450,7 +589,7 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   assert.ok(result.text.includes('session record: none still served'), result.text)
 }
 
-// 5 — a change record the Host no longer serves is reported, not guessed.
+// 5 — a change record the Host does not serve is reported, not guessed.
 {
   const h = harness({ summary: undefined, diffs: [] })
   const result = await h.invoke('')
@@ -492,7 +631,7 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   })
 }
 
-// 9 — the route resolves from agent.options first, with the older top-level fields as a fallback.
+// 9 — the route resolves from agent.options first, with the top-level agent fields as a fallback.
 {
   const configured = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
   assert.deepEqual(
@@ -746,8 +885,7 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   assert.equal(payload.withheld.length, 1)
 }
 
-// 20 — an unknown tool name is refused, never executed, and the refusal names
-// what this run does offer — a name one letter away from a reader tool included.
+// 20 — an unknown tool name is refused, never executed, and the refusal names what this run does offer — a name one letter from a reader tool included.
 {
   const h = harness({
     summary: SUMMARY,
@@ -774,8 +912,7 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   assert.equal(result.kind, 'success')
 }
 
-// 21 — the reader budget is enforced, the reader tools are then withdrawn, and
-// the review tools are not: the findings still have somewhere to go.
+// 21 — the reader budget is enforced, the reader tools are then withdrawn, and the review tools are not.
 {
   await withSettings({ maxToolCalls: 2 }, async () => {
     const h = harness({
@@ -825,7 +962,13 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
       summary: SUMMARY,
       diffs: [TEXT_DIFF, BINARY_DIFF],
       script: [
-        { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE }), toolCall('append_finding', PROVEN)] },
+        {
+          toolCalls: [
+            toolCall('read_file', { path: READ_ONLY_FILE }),
+            toolCall('list_dir', { path: 'internal' }),
+            toolCall('append_finding', PROVEN),
+          ],
+        },
         { toolCalls: [toolCall('set_summary', { summary: 'diff only' }), toolCall('finish_review', {})] },
       ],
     })
@@ -833,18 +976,30 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
     assert.deepEqual(h.seen.prompts[0].tools.map(tool => tool.name), REVIEW_TOOL_NAMES, 'only the review tools are offered')
     assert.equal(assertOneReading(h.seen.prompts[0], 'project access off'), false, 'and the contract says so, not the persona')
     assert.ok(h.seen.prompts[0].system.includes('This run cannot read the project'), 'the reviewer is told what this run can do')
-    const refusal = messagesOf(h.seen.prompts[1], 'tool')[0]
-    assert.equal(refusal.isError, true, 'a read is refused when project access is off')
-    assert.ok(refusal.content[0].text.includes('read_file is not available in this run'), refusal.content[0].text)
-    assert.ok(refusal.content[0].text.includes('append_finding'), 'and the refusal names the tools that are available')
+    const refused = messagesOf(h.seen.prompts[1], 'tool')
+    assert.equal(refused.length, 3, 'every call of the turn got exactly one result')
+    assert.equal(refused[0].isError, true, 'a read is refused when project access is off')
+    // The run's own gate is the reason, not the harness: the harness does expose
+    // `read` here, and saying otherwise would send the user to the wrong setting.
+    assert.ok(
+      refused[0].content[0].text.includes('read_file is not available in this run (project access is off for this run)'),
+      refused[0].content[0].text,
+    )
+    assert.ok(refused[0].content[0].text.includes('append_finding'), 'and the refusal names the tools that are available')
+    // list_dir is the plugin's own, so it reaches the run's own gate, which is the reason every reader tool refused here should carry.
+    assert.equal(refused[1].isError, true, 'a listing is refused too')
+    assert.ok(
+      refused[1].content[0].text.includes('list_dir is not available in this run (project access is off for this run)'),
+      refused[1].content[0].text,
+    )
+    assert.equal(refused[2].isError, undefined, 'and the finding is recorded anyway')
+    assert.equal(h.tools.calls.length, 0, 'a run that cannot read consults no harness tool for one')
     const payload = payloadOf(result.text)
     assert.equal(payload.findings.length, 1, 'a finding recorded from the diff alone is still published')
   })
 }
 
-// 23 — one failed call is retried with a smaller output cap and no project
-// access, but never without the review tools: without them a review cannot be
-// recorded at all.
+// 23 — one failed call is retried with a smaller output cap and no project access, but never without the review tools.
 {
   await withSettings({ projectAccess: true }, async () => {
     const h = harness({
@@ -867,9 +1022,7 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   })
 }
 
-// 24 — reading stops at the configured fraction of the timeout, not at the hard
-// kill: the read-only tools are not offered, and the contract — written from
-// that same answer — does not claim them either.
+// 24 — reading stops at the configured fraction of the timeout, not at the hard kill, and the contract does not claim the tools either.
 {
   await withSettings({ timeoutMs: 1000, toolDeadlineRatio: 0.0000001 }, async () => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
@@ -880,10 +1033,7 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   })
 }
 
-// 24b — the reading bounds are one policy, not three: the byte budget withdraws
-// the reader tools from the offer exactly as the call budget and the clock do,
-// refuses a call with its own reason, and the refusal that lists what a run
-// offers stops promising a tool it would refuse.
+// 24b — the byte budget withdraws the reader tools exactly as the call budget and the clock do, and no offer still promises a tool it would refuse.
 {
   await withSettings({ maxReadBytes: 1 }, async () => {
     const h = harness({
@@ -1013,7 +1163,7 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   })
 }
 
-// 30 — when the newest record is no longer served, an older one is reviewed instead, and said so.
+// 30 — when the newest record is not among those served, an earlier one is reviewed instead, and the report says so.
 {
   const h = harness({
     summaries: { 5: SUMMARY },
@@ -1029,7 +1179,6 @@ const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
   assert.ok(result.text.includes('have no comparison in this Host process'), 'the report says so')
 }
 
-/** A real repository with one committed file, one local edit and one new file. */
 function gitFixture() {
   const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-repo-'))
   const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
@@ -1089,9 +1238,7 @@ const GIT_FINDING = {
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.source, 'session', 'a clean tree falls back to the recorded changes')
   assert.equal(payload.stats.reviewed, 1)
-  // The record this source reads is this session's own work, so the prompt must
-  // present it as primary. Labelling it "not by this session" would point the
-  // reviewer at the rest of the workspace instead of at the change set.
+  // This record is this session's own work, so the prompt must present it as primary; 'not by this session' would point the reviewer at the rest of the workspace.
   const prompt = h.seen.prompts[0].messages[0].content[0].text
   assert.ok(
     prompt.includes('primary — written or edited in this session: internal/chessx/board.go'),
@@ -1193,17 +1340,12 @@ const GIT_FINDING = {
   assert.ok(!prompt.includes('previous report body'), 'the notice never leaks in')
 }
 
-/** The React stand-in for helper tests: it never draws, so no component runs. */
 const STUB_REACT = {
   createElement: () => null,
   useMemo: () => undefined,
   useState: () => [true, () => {}],
 }
 
-/**
- * A React stand-in that records the element tree instead of drawing it, so what
- * the card would show can be inspected without a browser.
- */
 function recordingReact() {
   const h = (type, props, ...children) => ({
     type,
@@ -1219,11 +1361,6 @@ function recordingReact() {
   }
 }
 
-/**
- * Load the Client artifact the way the page does and return its module
- * descriptor, so a test can build it with whichever React stand-in it needs.
- * The module is imported once — a page also evaluates it once.
- */
 let clientModule
 async function loadClientModule() {
   if (clientModule !== undefined) return clientModule
@@ -1242,10 +1379,6 @@ async function loadClientModule() {
   return clientModule
 }
 
-/**
- * Mount the card for one command outcome and collect what it would show: the
- * visible strings and the caption of every button it draws.
- */
 async function renderCard(outcome) {
   const api = (await loadClientModule()).factory(() => recordingReact())
   let Card
@@ -1262,7 +1395,6 @@ async function renderCard(outcome) {
   const seen = { texts: [], buttons: [] }
   const visit = node => {
     if (typeof node === 'string') {
-      // The stylesheet is one long child; it is not something the card shows.
       if (node.length < 80 && !node.includes('{')) seen.texts.push(node)
       return
     }
@@ -1279,7 +1411,6 @@ async function renderCard(outcome) {
   return seen
 }
 
-/** Load the module API with the inert React above, for its pure helpers. */
 let clientApi
 async function loadClientApi() {
   if (clientApi !== undefined) return clientApi
@@ -1459,10 +1590,6 @@ async function loadClientApi() {
   })
 }
 
-/**
- * A repository whose session works in `sub/`, with unrelated changes elsewhere.
- * The session directory is deliberately not the repository root.
- */
 function subdirectoryFixture() {
   const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-subrepo-'))
   const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
@@ -1556,8 +1683,6 @@ function subdirectoryFixture() {
     'the Client half exposes copy helpers and the mode reader only — there is no send path to misuse',
   )
 
-  // The face decides what the card claims. A command that succeeded but whose
-  // payload did not parse must not be reported as a review that never ran.
   assert.equal(api.__test.readOutcome(null).face, 'running')
   assert.equal(api.__test.readOutcome({ kind: 'error', text: 'boom' }).face, 'error')
   assert.equal(
@@ -1585,9 +1710,6 @@ function subdirectoryFixture() {
     'a finding that names no file stays clean',
   )
 
-  // The copy follows the mode the payload describes: an arc finding pastes the
-  // way the arc card drew it, and a field that mode does not declare is not
-  // copied at all.
   const arcMode = api.__test.modeOf({
     mode: {
       id: 'arc',
@@ -1627,8 +1749,6 @@ function subdirectoryFixture() {
   assert.ok(result.text.includes('Reset panics instead of resetting'), 'with the finding in it')
   assert.ok(result.text.includes('**Evidence:**'), 'and the evidence behind it')
 
-  // The Client half reads exactly what the Host half wrote: the two halves meet
-  // on the payload marker, and the copy takes the report without it.
   const api = await loadClientApi()
   const payload = api.__test.parsePayload(result.text)
   assert.equal(payload?.findings?.length, 1, 'the card parses the host report')
@@ -1644,24 +1764,19 @@ function subdirectoryFixture() {
   const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-numstat-'))
   const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
   git(['init', '-q'])
-  // Every line below is chosen so that its diff line collides with a file header
-  // or a hunk marker: a deleted `-- x` renders as `--- x`, an added `++ x` renders
-  // as `+++ x`, an added `+++ x` as `++++ x`.
+  // Each line collides with a file header or a hunk marker: a deleted '-- x' renders as '--- x', an added '++ x' as '+++ x'.
   writeFileSync(join(repo, 'tricky.txt'), ['alpha', '-- old sql comment', '--- old rule', '++ old increment', 'omega', ''].join('\n'))
   writeFileSync(join(repo, 'tail.txt'), 'first\nsecond\n')
   git(['add', '.'])
   git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
   writeFileSync(join(repo, 'tricky.txt'), ['alpha', '-- new sql comment', '--- new rule', '++ new increment', '+++ new triple', 'omega', ''].join('\n'))
-  // No trailing newline: git appends a `\ No newline at end of file` marker that
-  // must not be counted as either side.
+  // No trailing newline: the '\ No newline at end of file' marker git appends must not be counted as either side.
   writeFileSync(join(repo, 'tail.txt'), 'first\nchanged')
 
   const totals = git(['diff', '--numstat']).stdout.trim().split('\n')
     .map(line => line.split('\t'))
     .filter(cols => /^\d+$/.test(cols[0]) && /^\d+$/.test(cols[1]))
     .reduce((sum, cols) => ({ added: sum.added + Number(cols[0]), deleted: sum.deleted + Number(cols[1]) }), { added: 0, deleted: 0 })
-  // A guard that the fixture is a real change; the assertions that matter are the
-  // agreement with git below and the ambiguous lines the diff is checked for.
   assert.ok(totals.added > 0 && totals.deleted > 0, `the fixture changes lines: ${JSON.stringify(totals)}`)
 
   const h = harness({
@@ -1716,8 +1831,6 @@ function subdirectoryFixture() {
     ['action.copyReport', 'toggle.hide', 'action.copyFinding'],
     'the card draws the two copy actions and the collapse toggle, in that order',
   )
-  // The guarantee this test exists for: no control on the card can reach the
-  // agent. A button that is neither a copy action nor the toggle fails here.
   const ALLOWED = new Set(['action.copyReport', 'action.copyFinding', 'toggle.hide', 'toggle.show'])
   assert.deepEqual(
     full.buttons.filter(caption => !ALLOWED.has(caption)),
@@ -1725,8 +1838,6 @@ function subdirectoryFixture() {
     'nothing on the card does anything but copy or collapse',
   )
   assert.ok(full.texts.includes('a.go:3'), 'the finding names its location')
-  // A payload without a `mode` block is drawn with the card's own fallback
-  // vocabulary, so a truncated payload still renders.
   assert.ok(full.texts.includes('Impact: i'), 'and carries its impact')
   assert.ok(full.texts.includes('How it is reached: tr'), 'and how it is reached')
   assert.ok(full.texts.includes('Evidence'), 'and the evidence behind it')
@@ -1809,8 +1920,7 @@ function subdirectoryFixture() {
   assert.equal(payloadOf(result.text).stats.reviewed, 2, 'both files are reviewed')
   const prompt = h.seen.prompts[0].messages[0].content[0].text
   const occurrences = needle => prompt.split(needle).length - 1
-  // Read as a glob, `a[1].go` also matches `a1.go`, so one file's change would
-  // be pulled into the other's diff and reported twice.
+  // Read as a glob, 'a[1].go' also matches 'a1.go', so one file's change would be pulled into the other's diff and reported twice.
   assert.equal(occurrences('+var ONE = 2'), 1, 'each file is diffed once')
   assert.equal(occurrences('+var TWO = 2'), 1, 'and the pattern-like name pulled in no other file')
 }
@@ -1823,8 +1933,7 @@ function subdirectoryFixture() {
   writeFileSync(join(repo, 'a.go'), 'package a\n\nvar A = 1\n')
   git(['add', '.'])
   git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
-  // The added line is whitespace only and it is the last line, so trimming the
-  // whole diff would silently rewrite it into a bare '+'.
+  // The added line is whitespace only and last, so trimming the whole diff would rewrite it into a bare '+'.
   writeFileSync(join(repo, 'a.go'), 'package a\n\nvar A = 1\n   \n')
 
   const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'verbatim')] })
@@ -1835,12 +1944,6 @@ function subdirectoryFixture() {
   assert.ok(!prompt.includes('\n+\n'), 'and was not rewritten into a bare +')
 }
 
-/**
- * A repository with no ignore file of its own: a changed source file next to the
- * junk every project produces. `vendor/lib/vendored.go` is tracked — committed
- * by force, the mistake that makes `node_modules` show up in a diff — while the
- * dependency tree, the bundle and the log are untracked.
- */
 function noisyFixture() {
   const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-noisy-'))
   const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
@@ -1861,7 +1964,6 @@ function noisyFixture() {
   return { repo, git }
 }
 
-/** The change-set junk a noisyFixture review must never have looked at. */
 const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VENDOR_NEEDLE']
 
 // 57 — the built-in list keeps dependencies, build output and logs out of the diff.
@@ -1920,9 +2022,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(!h.seen.prompts[0].messages[0].content[0].text.includes('GEN_NEEDLE'), 'and keeps the path out')
   })
 
-  // Typed on the command line: one pattern adds, one negation takes a built-in
-  // default back, one quoted pattern holds a space, and the rest of the line is
-  // still the focus message.
   mkdirSync(join(repo, 'odd dir'), { recursive: true })
   writeFileSync(join(repo, 'odd dir', 'note.md'), 'ODD_NEEDLE\n')
   const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'typed')] })
@@ -1965,7 +2064,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   )
   assert.ok(!h.seen.prompts[0].messages[0].content[0].text.includes('REPO_NEEDLE'))
 
-  // A negation wins over the repository's own rules too: the user is the last word.
   const over = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'rescued')] })
   await over.invoke('ignored=!generated/api.go')
   assert.ok(
@@ -1993,7 +2091,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(h.seen.prompts[0].messages[0].content[0].text.includes('DEPENDENCY_NEEDLE'))
   })
 
-  // A typed argument beats the config file in both directions.
   await withSettings({ ignoreDefaults: false }, async () => {
     const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'defaults back')] })
     const result = await h.invoke('ignoreDefaults=true')
@@ -2154,8 +2251,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   }
   const text = `## Code review — PASS\n\nA summary.\n\n${MARKER}\n\`\`\`json\n${JSON.stringify(report)}\n\`\`\`\n`
   const card = await renderCard({ kind: 'success', text })
-  // The meta line is longer than the recorder keeps, so what proves the count
-  // here is the section itself: the label carries it and each row names its rule.
+  // The recorder truncates the meta line, so the section's own label and rows are what prove the count.
   assert.ok(card.texts.includes('label.ignored (2)'), 'the section names the count')
   assert.ok(card.texts.includes('node_modules/a.js — node_modules/'), 'and shows the rule behind each file')
   assert.ok(card.texts.includes('dist/b.js — dist/'))
@@ -2211,8 +2307,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(tool[0].content[0].text.includes("the repository's own ignore rules"), 'and names that layer')
   assert.ok(!tool[0].content[0].text.includes('REPO_NEEDLE'), 'the file is never read at all')
   assert.ok(tool[1].content[0].text.includes('no match for "REPO_NEEDLE"'), 'and a search cannot find it')
-  // The repository layer is a list of the paths git itself reports, so a
-  // directory name can still be listed; what must never show up is the file.
   assert.ok(!tool[2].content[0].text.includes('api.go'), 'the ignored file is in no listing')
   assert.ok(tool[3].content[0].text.includes('0 entries'), 'and its own directory lists empty')
   const payload = payloadOf(result.text)
@@ -2227,8 +2321,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   mkdirSync(join(home, '.dsh', 'code-review'), { recursive: true })
   writeFileSync(join(home, '.dsh', 'code-review', 'config.json'), JSON.stringify({ maxFiles: 1 }))
   const previous = { DSH_HOME: process.env.DSH_HOME, HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
-  // `dsh web` is started from wherever the user is, and its process may carry no
-  // DSH_HOME at all; the home is then `~/.dsh`, which is what os.homedir() reads.
+  // 'dsh web' may run with no DSH_HOME at all; the home is then '~/.dsh', which is what os.homedir() reads.
   delete process.env.DSH_HOME
   process.env.HOME = home
   process.env.USERPROFILE = home
@@ -2262,7 +2355,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   git(['add', '.gitignore', 'src/app.js'])
   git(['add', '-f', 'dist/bundle.js'])
   git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
-  // The session edits the committed, ignored bundle; someone else edits src.
   writeFileSync(join(repo, 'dist', 'bundle.js'), 'var bundle = 2\n')
   writeFileSync(join(repo, 'src', 'app.js'), 'export const a = 2\n')
   const root = realpathSync(repo)
@@ -2281,8 +2373,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(!result.text.includes('none of them differs'), 'and the change is never called a no-op')
   assert.equal(h.seen.prompts.length, 0, 'no reviewer call is spent on it')
 
-  // An ignored file the session never touched is not this run's business: a
-  // session review that does have work reports no exclusion at all.
   writeFileSync(join(repo, 'src', 'app.js'), 'export const a = 3\n')
   const own = harness({
     cwd: repo,
@@ -2298,10 +2388,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(payload.stats.ignore.count, 0, "another file's exclusion is not reported as this run's")
 }
 
-// 69 — a harness home that has never held a settings file gets one, written by
-// the plugin itself: this release's settings in the order it declares them, then
-// the modes, each entry carrying what the mode declares — and that file is what
-// decides the run that created it.
+// 69 — a home that has never held a settings file gets one, written by the plugin itself, and that file decides the run that created it.
 {
   await withEmptyHome(async home => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
@@ -2338,8 +2425,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 70 — a settings file removed while the harness is up is created again by the
-// run that needs it, instead of leaving the user without one until a restart.
+// 70 — a settings file removed while the harness is up is created again by the run that needs it.
 {
   await withEmptyHome(async home => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
@@ -2356,9 +2442,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 71 — a hand-written file is completed, never overwritten: what the user wrote
-// still decides the run, a key of the user's own and the file's own order stand,
-// and a second load does not write a byte.
+// 71 — a hand-written file is completed, never overwritten: the user's keys and order stand, and a second load writes no byte.
 {
   await withEmptyHome(async home => {
     const file = settingsPath(home)
@@ -2383,8 +2467,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 72 — a file that does not parse is reported and left exactly as it is: the
-// plugin never repairs a user's file behind their back.
+// 72 — a file that does not parse is reported and left exactly as it is: the plugin never repairs a user's file behind their back.
 {
   await withEmptyHome(async home => {
     const file = settingsPath(home)
@@ -2423,8 +2506,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 74 — mode=arc runs the architecture role: its persona, its vocabulary, its
-// own word for the verdict, and the same contract no mode can change.
+// 74 — mode=arc runs the architecture role: its persona, its vocabulary, its own word for the verdict, and the same contract no mode can change.
 {
   const h = harness({
     summary: SUMMARY,
@@ -2460,8 +2542,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(result.text.includes('(high 1)'), 'the severity counts use the mode\'s names')
 }
 
-// 75 — the fields a mode requires are what the gate enforces: arc asks for the
-// consequence and the alternative it proposes, not for a code review's impact.
+// 75 — the fields a mode requires are what the gate enforces: arc asks for the consequence and the alternative, not for a code review's impact.
 {
   const h = harness({
     summary: SUMMARY,
@@ -2474,9 +2555,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(payload.withheld[0].reason.includes('Alternative'), payload.withheld[0].reason)
   assert.equal(payload.verdict, 'pass', 'a withheld finding never carries a verdict')
 
-  // A field the mode does not declare is refused by name — and the refusal names
-  // the vocabulary this mode records in — so the reviewer fixes the call instead
-  // of the finding quietly losing the field it meant to state.
   const other = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
@@ -2494,8 +2572,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(otherPayload.withheld[0].reason.includes('"consequence"'), otherPayload.withheld[0].reason)
 }
 
-// 76 — evidence is required in every mode: a mode that leaves it out of its
-// field list still gets it, and a finding without it is never published.
+// 76 — evidence is required in every mode, even one that leaves it out of its own field list.
 {
   await withSettings({
     modes: {
@@ -2533,8 +2610,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 77 — a mode that does not exist is refused, with the modes that do, and no
-// model call is spent finding out.
+// 77 — a mode that does not exist is refused, with the modes that do, and no model call is spent finding out.
 {
   const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
   const result = await h.invoke('mode=nope')
@@ -2556,8 +2632,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(payloadOf((await aliased.invoke('mode=codereview')).text).mode.id, 'cr', 'and cr has aliases too')
 }
 
-// 79 — a mode the user wrote: its prompt, its fields, its severities and its own
-// settings, with no other focus area in the contract it is given.
+// 79 — a mode the user wrote: its prompt, its fields, its severities and its own settings, with no other focus area in the contract.
 {
   await withSettings({
     modes: {
@@ -2617,8 +2692,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 80 — what the file states wins over what this release ships, and the contract
-// is appended to it either way.
+// 80 — what the file states wins over what this release ships, and the contract is appended to it either way.
 {
   await withSettings({ modes: { cr: { systemPrompt: 'You are the hand-written reviewer.' } } }, async () => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
@@ -2638,8 +2712,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 81 — the file is completed, never rewritten: a release mode comes back whole,
-// a mode of the user's own is left exactly as it is, and nothing is written twice.
+// 81 — the file is completed, never rewritten: a release mode comes back whole and a mode of the user's own is left as it is.
 {
   await withEmptyHome(async home => {
     const file = settingsPath(home)
@@ -2661,8 +2734,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 82 — a disabled mode is not offered, and a disabled default falls back loudly
-// rather than leaving `/review` unusable.
+// 82 — a disabled mode is not offered, and a disabled default falls back loudly rather than leaving /review unusable.
 {
   await withSettings({ modes: { arc: { enabled: false } } }, async () => {
     const refused = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
@@ -2682,8 +2754,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(value.mode.id, 'cr', 'a bare /review still runs the default mode')
   assert.ok(warnings.some(line => line.includes('is disabled')), warnings.join('\n'))
 
-  // A file that switches everything off has nothing to run, and says so rather
-  // than picking a mode the user took off the surface.
   await withSettings({ modes: { cr: { enabled: false }, arc: { enabled: false } } }, async () => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
     const result = await h.invoke('')
@@ -2693,8 +2763,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 83 — a mode's settings are a preset: they win over the file's own, and what is
-// typed after /review wins over both.
+// 83 — a mode's settings are a preset: they win over the file's own, and what is typed after /review wins over both.
 {
   await withSettings({
     language: 'en',
@@ -2724,8 +2793,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 84 — a mode written wrong is reported and run with what is usable: junk keys,
-// reserved field names and settings a mode may not set are named, never obeyed.
+// 84 — a mode written wrong is reported and run with what is usable: junk keys, reserved field names and forbidden settings are named, never obeyed.
 {
   await withSettings({
     modes: {
@@ -2765,15 +2833,12 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(warnings.some(line => line.includes('is not a setting this plugin reads')), warnings.join('\n'))
     assert.ok(warnings.some(line => line.includes('cannot be set by a mode')), warnings.join('\n'))
     assert.ok(warnings.some(line => line.includes('declared twice')), warnings.join('\n'))
-    // The one thing a severity table may not do quietly: claim a verdict or a
-    // tone that does not exist. Both are named and the usable part runs.
     assert.ok(warnings.some(line => line.includes('verdict "whatever"')), warnings.join('\n'))
     assert.ok(warnings.some(line => line.includes('tone "rainbow"')), warnings.join('\n'))
   })
 }
 
-// 85 — the card draws whatever mode the payload describes, and still cannot
-// send anything.
+// 85 — the card draws whatever mode the payload describes, and still cannot send anything.
 {
   const h = harness({
     summary: SUMMARY,
@@ -2795,10 +2860,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     'a mode changes what the card says, never what it can do',
   )
 
-  // The same card path, on the mode that ships as the default: the vocabulary
-  // travels in the payload, so the card needs no branch for either of them. The
-  // long fields are asserted through the copy, which is the same renderer the
-  // report uses.
   const cr = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([PROVEN], 'Nil board.')] })
   const crText = (await cr.invoke('')).text
   const crCard = await renderCard({ kind: 'success', text: crText })
@@ -2813,8 +2874,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(pasted.includes(`**Impact:** ${PROVEN.impact}`), 'in the mode\'s own order and wording')
 }
 
-// 86 — the file decides which mode a bare /review runs, and the command line
-// still overrides it.
+// 86 — the file decides which mode a bare /review runs, and the command line still overrides it.
 {
   await withSettings({ mode: 'arc' }, async () => {
     const bare = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
@@ -2824,8 +2884,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 87 — a mode with no persona is still a working mode: the contract alone is the
-// system prompt, and the minimum field set is what a finding must state.
+// 87 — a mode with no persona is still a working mode: the contract alone is the system prompt.
 {
   await withSettings({ modes: { bare: { systemPrompt: '', task: '', fields: [] } } }, async () => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
@@ -2845,11 +2904,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 88 — a severity the mode does not declare is refused by name, and the refusal
-// names the table it does declare: nothing is lowered or substituted, so the
-// severity the reviewer meant is either recorded as the mode spells it or not
-// recorded at all. What the mode's table says is what the verdict follows,
-// whatever order the table is written in.
+// 88 — a severity the mode does not declare is refused by name, never lowered or substituted, and the verdict follows the mode's table whatever order it is written in.
 {
   await withSettings({
     modes: {
@@ -2896,7 +2951,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.equal(messagesOf(h.seen.prompts[1], 'tool').filter(message => message.isError === true).length, 1, 'the refused call changed nothing')
   })
 
-  // cr's own table refuses the same way, and the verdict never inflates.
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
@@ -2913,12 +2967,8 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(payload.verdict, 'warn', 'and a nit is a warning, never a failure')
 }
 
-// 89 — the thinking level of a run: the config file and the mode preset carry
-// it, the command line overrides both, an empty layer presets nothing, and a
-// level the model does not offer is refused before a single call is spent.
+// 89 — the thinking level comes from the config file and the mode preset, the command line overrides both, and a level the model does not offer costs no call.
 {
-  // A fresh file carries the key, and a run that names no level sends none at
-  // all — the provider's own default is what decides there.
   await withEmptyHome(async home => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
     const created = JSON.parse(readFileSync(settingsPath(home), 'utf8'))
@@ -2929,7 +2979,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(!text.includes('thinking:'), 'nor does the report name a level nobody chose')
   })
 
-  // The mode's preset beats the file's value; what is typed beats them both.
   await withSettings({
     reasoningEffort: 'low',
     modes: { cr: { settings: { reasoningEffort: 'max' } } },
@@ -2945,7 +2994,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.equal(typed.seen.prompts[0].reasoningEffort, 'off', 'and what is typed beats them both')
   })
 
-  // An empty layer states no preference: it never erases the value below it.
   await withSettings({
     reasoningEffort: 'low',
     modes: { cr: { settings: { reasoningEffort: '' } } },
@@ -2955,8 +3003,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.equal(h.seen.prompts[0].reasoningEffort, 'low', 'an empty preset leaves the file in force')
   })
 
-  // A level the model does not offer is refused with the levels it does, and
-  // the refusal costs no model call — the rule an unknown mode already follows.
   await withSettings({ reasoningEffort: 'ultra' }, async () => {
     const offered = harness({
       summary: SUMMARY,
@@ -2975,8 +3021,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(bareResult.text.includes('declares no reasoning levels'), bareResult.text)
     assert.equal(bare.seen.prompts.length, 0)
 
-    // A route the adapter cannot describe is left to the call itself: the
-    // setting still reaches the request, exactly as it did before the check.
     const unknown = harness({
       summary: SUMMARY,
       diffs: [TEXT_DIFF, BINARY_DIFF],
@@ -2988,9 +3032,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 90 — the six review tools are the protocol: the same names in the same order
-// under every setting, mode and command line, and nothing a user configures —
-// not even a mode's own settings — adds, removes or renames one.
+// 90 — the six review tools are the protocol: the same names in the same order under every setting, mode and command line.
 {
   await withSettings({}, async () => {
     for (const [what, args] of [['a bare run', ''], ['an alias', 'mode=codereview']]) {
@@ -3016,8 +3058,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.equal(assertOneReading(h.seen.prompts[0], 'every reader bound is closed'), false, 'and the contract claims no reading')
   })
 
-  // A mode's settings block is a preset of run settings, not a tool switch: an
-  // unknown key is reported and ignored, so a mode cannot take a tool away.
   await withSettings({
     modes: { cr: { settings: { tools: [], append_finding: false, reviewTools: ['nothing'], finish_review: 'off' } } },
   }, async () => {
@@ -3040,9 +3080,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 91 — a call the store cannot use is refused with everything that was wrong
-// with it, changes nothing, and the run carries on: what was recorded before it
-// is still the review, and one corrected call is all it takes.
+// 91 — a call the store cannot use is refused with everything that was wrong with it, changes nothing, and the run carries on.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3098,9 +3136,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.deepEqual(payload.stats.store, { calls: 11, appended: 1, updated: 0, deleted: 0 }, 'the refused calls that reached the store are counted, and changed nothing')
 }
 
-// 92 — the evidence corpus only grows: a finding recorded before the file behind
-// it was read is withheld at that moment, and the report publishes it once the
-// read has happened, with no further call from the reviewer.
+// 92 — the evidence corpus only grows: a finding recorded before the file behind it was read is published once the read has happened.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3131,8 +3167,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(payload.stats.store.appended, 1)
 }
 
-// 93 — update and delete are how a finding a later look invalidated leaves the
-// review: the id addresses it, the report follows, and the order never moves.
+// 93 — update and delete are how a finding a later look invalidated leaves the review: the id addresses it and the order never moves.
 {
   const second = { ...PROVEN, severity: 'minor', title: 'A second finding', evidence: '+extra' }
   const h = harness({
@@ -3169,8 +3204,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.deepEqual(payload.stats.store, { calls: 7, appended: 2, updated: 1, deleted: 1 })
 }
 
-// 94 — a run the stream cut off keeps every finding already recorded and hands
-// them over as a partial report that says so, to the user and to the agent.
+// 94 — a run the stream cut off keeps every finding already recorded and hands them over as a partial report that says so.
 {
   await withSettings({ notifyAgent: 'steer' }, async () => {
     const h = harness({
@@ -3199,8 +3233,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 95 — a failure that leaves nothing recorded is an error, not an empty pass,
-// and a run gets one retry: never a second one on top of a stored finding.
+// 95 — a failure that leaves nothing recorded is an error, and a run gets one retry, never a second one on top of a stored finding.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3217,8 +3250,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(h.seen.prompts.length, 2, 'the failed call and one retry, nothing more')
 }
 
-// 95b — a stream that breaks after a fruitless turn is an error too: there is no
-// conclusion to report and no partial report to make.
+// 95b — a stream that breaks after a fruitless turn is an error too: there is no conclusion and no partial report to make.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3232,8 +3264,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(result.text.includes('socket closed'), result.text)
 }
 
-// 96 — a model that stops without finishing is asked to finish, and when it will
-// not, the report is built from the store and marked incomplete.
+// 96 — a model that stops without finishing is asked to finish, and when it will not, the report is built from the store and marked incomplete.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3254,8 +3285,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(result.text.includes('- incomplete: the reviewer stopped without calling finish_review'), result.text)
 }
 
-// 97 — a cancelled run keeps what it recorded and says it was cancelled, and a
-// cancel before anything was recorded still refuses.
+// 97 — a cancelled run keeps what it recorded and says it was cancelled; a cancel before anything was recorded still refuses.
 {
   const cancelled = harness({
     summary: SUMMARY,
@@ -3280,8 +3310,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(refused.text.includes('review cancelled'), refused.text)
 }
 
-// 98 — the loop always ends: a model that keeps calling tools without finishing
-// runs into this run's own turn limit, and what it recorded survives.
+// 98 — the loop always ends: a model that keeps calling tools without finishing meets the run's own turn limit.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3300,8 +3329,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(payload.stats.store.calls, 150, 'one call per turn, every one of them answered')
 }
 
-// 99 — the store has a ceiling, and reaching it changes nothing already
-// recorded: the first hundred findings are reported and the next is refused.
+// 99 — the store has a ceiling, and reaching it changes nothing already recorded.
 {
   const appends = Array.from({ length: 101 }, (_, index) => toolCall('append_finding', {
     ...PROVEN, title: `Finding ${index + 1}`,
@@ -3326,10 +3354,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(payload.findings.at(-1).title, 'Finding 100')
 }
 
-// 99b — the finding-tool call cap closes the store without closing the review:
-// past it the review takes no more changes, while the calls that inspect it,
-// describe it and end it still work — and the report names the cap as the reason
-// the list may be short.
+// 99b — the finding-tool call cap closes the store without closing the review: the calls that inspect, describe and end it still work, and the report names the cap.
 {
   const lists = Array.from({ length: 300 }, () => toolCall('list_findings', {}))
   const h = harness({
@@ -3367,9 +3392,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(result.text.includes('- incomplete: the reviewer used its 300 finding-tool calls'), result.text)
 }
 
-// 99c — a capped run that never finishes still names the cap, and a capped run
-// that recorded nothing is an error whose text does not blame the route: the
-// model did call tools, the store just had no room left to record in.
+// 99c — a capped run that never finishes still names the cap, and a capped run that recorded nothing is an error that does not blame the route.
 {
   const lists = Array.from({ length: 300 }, () => toolCall('list_findings', {}))
   const h = harness({
@@ -3403,8 +3426,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(!refused.text.includes('can call tools'), 'the route is not blamed for a cap the model reached')
 }
 
-// 100 — finish_review ends the review: a call after it in the same turn is
-// refused, and the report is exactly what was recorded before it.
+// 100 — finish_review ends the review: a call after it in the same turn is refused, and the report is what was recorded before it.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3428,8 +3450,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.deepEqual(payload.stats.store, { calls: 3, appended: 1, updated: 0, deleted: 0 }, 'and it is counted as a refusal')
 }
 
-// 101 — set_summary opens the report, the last one wins, and a review that
-// records none says so instead of inventing one.
+// 101 — set_summary opens the report, the last one wins, and a review that records none says so instead of inventing one.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3457,8 +3478,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(bareResult.text.includes('(no summary returned)'), bareResult.text)
 }
 
-// 102 — the card shows that a review stopped early, and still offers nothing but
-// the copy actions.
+// 102 — the card shows that a review stopped early, and still offers nothing but the copy actions.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3482,8 +3502,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   )
 }
 
-// 103 — the tool a mode gets carries that mode's own vocabulary: its severity
-// ids, its fields in its order, its guides as the parameter descriptions.
+// 103 — the tool a mode gets carries that mode's own vocabulary: its severity ids, its fields in its order, its guides as the parameter descriptions.
 {
   await withSettings({
     modes: {
@@ -3523,9 +3542,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 104 — the finding structure is closed to the modes: a mode that declares a
-// structural key — or the store's `summary` and `id` — as one of its own fields
-// is told so, and the meaning the store gave the key stands.
+// 104 — the finding structure is closed to the modes: a mode that declares a structural key is told so, and the store's meaning for that key stands.
 {
   const reserved = ['severity', 'category', 'file', 'line', 'title', 'summary', 'id']
   const fields = [...reserved.map(key => ({ key, label: `Mine: ${key}` })), { key: 'problem' }]
@@ -3544,8 +3561,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 105 — evidence is only what a tool returned: neither a refusal nor the review's
-// own traffic is a line of code, and a finding that quotes one is withheld.
+// 105 — evidence is only what a tool returned: neither a refusal nor the review's own traffic is a line of code.
 {
   const h = harness({
     summary: SUMMARY,
@@ -3570,9 +3586,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   }
 }
 
-// 106 — one policy bounds the model's context for both tool families: a
-// store-heavy run elides its own confirmations and listings like any other tool
-// output, and the figure the run reports counts all of it, not the reader half.
+// 106 — one policy bounds the model's context for both tool families, and the figure the run reports counts all of it, not the reader half.
 {
   const findings = Array.from({ length: 100 }, (_, index) => ({ ...PROVEN, title: `Finding ${index + 1}` }))
   const lists = Array.from({ length: 40 }, () => toolCall('list_findings', {}))
@@ -3603,9 +3617,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   )
 }
 
-// 107 — the cap is a fact about the store, not a sentence the end-of-run
-// bookkeeping compares: whatever stopped the run, the report says the store had
-// already closed when that is why the review is short.
+// 107 — the cap is a fact about the store, not a sentence the end-of-run bookkeeping compares: whatever stopped the run, the report says the store had already closed when that is why it is short.
 {
   const lists = Array.from({ length: 301 }, () => toolCall('list_findings', {}))
   const h = harness({
@@ -3630,17 +3642,13 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(payload.stats.store.calls, 303)
 }
 
-// 108 — the finding structure is one table: the keys the model is offered, the
-// keys the store records and the keys a refusal names are one set, so a call the
-// schema describes cannot come back as "not a finding field".
+// 108 — the finding structure is one table: the keys the model is offered, the store records and a refusal names are one set.
 {
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
     script: [
-      // Every key the schema declares, in one call.
       { toolCalls: [toolCall('append_finding', PROVEN)] },
-      // One key it does not.
       { toolCalls: [toolCall('append_finding', { ...PROVEN, title: 'A key of my own', impactt: 'typo' })] },
       record([], 'done'),
     ],
@@ -3655,6 +3663,435 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.deepEqual(named.split(', '), offered, 'and the refusal names exactly the keys the schema offered')
   const [finding] = payloadOf(result.text).findings
   assert.deepEqual(Object.keys(finding).filter(key => key !== 'id'), offered, 'every offered key is one the store records')
+}
+
+// 109 — read_file is the harness's read: the path and window the wrapper resolved are what reaches the tool, an ignored path never reaches it, and the file the report names is the workspace's own however the backend spells it.
+{
+  const script = [
+    {
+      toolCalls: [
+        toolCall('read_file', { path: READ_ONLY_FILE, offset: 3, limit: 2 }),
+        toolCall('read_file', { path: 'node_modules/dep/index.js' }),
+      ],
+    },
+    record([], 'windowed'),
+  ]
+  const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  assert.deepEqual(
+    h.tools.calls,
+    [{ name: 'read', arguments: { file_path: join(WS, 'internal', 'play', 'move.go'), offset: 3, limit: 2 } }],
+    'exactly one read reached the harness: the absolute path and the resolved window, and never the ignored one',
+  )
+  const tool = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(tool[0].isError, undefined, tool[0].content[0].text)
+  assert.ok(tool[0].content[0].text.includes(`[${READ_ONLY_FILE} — lines 3-4 of 5]`), tool[0].content[0].text)
+  assert.ok(tool[0].content[0].text.includes('func Apply(b *chessx.Board) {'), 'the window holds the lines asked for')
+  assert.ok(!tool[0].content[0].text.includes('package play'), 'and none before them')
+  assert.equal(tool[1].isError, true, 'an ignored path is refused without the harness being asked')
+  assert.ok(tool[1].content[0].text.includes("excluded by the review's ignore rules"), tool[1].content[0].text)
+  assert.deepEqual(
+    payloadOf(result.text).stats.context.files,
+    [READ_ONLY_FILE],
+    'an absolute value.path is not what the report names the file',
+  )
+
+  const relative = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], readPath: 'relative', script })
+  await relative.invoke('')
+  assert.ok(
+    messagesOf(relative.seen.prompts[1], 'tool')[0].content[0].text.includes(`[${READ_ONLY_FILE} — lines 3-4 of 5]`),
+    'and a backend that reports a relative path is believed as it stands',
+  )
+}
+
+// 110 — search is the harness's grep: the query arrives as the escaped literal ripgrep needs, at the workspace root, and the rows are the review's own "path:line: text".
+{
+  writeFileSync(join(WS, 'internal', 'chessx', 'marks.txt'), [
+    'var size = board.squares',
+    'var sizeTypo = boardXsquares',
+    '',
+  ].join('\n'))
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('search', { query: 'board.squares' })] },
+      record([], 'searched'),
+    ],
+  })
+  await h.invoke('')
+  assert.deepEqual(
+    h.tools.calls,
+    [{ name: 'grep', arguments: { pattern: 'board\\.squares', path: WS } }],
+    'the escaped literal, not the query, is what the regular-expression tool is asked for',
+  )
+  const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+  assert.ok(tool.content[0].text.includes('[1 match(es) for "board.squares"]'), tool.content[0].text)
+  assert.ok(
+    tool.content[0].text.includes('internal/chessx/marks.txt:1: var size = board.squares'),
+    'a row is path:line: text',
+  )
+  assert.ok(!tool.content[0].text.includes('boardXsquares'), 'and a dot the query meant literally matched no other character')
+}
+
+// 111 — the ignore rules gate what comes back too: a match the harness returned from an ignored path is dropped by the wrapper, and cannot become a finding.
+{
+  mkdirSync(join(WS, 'node_modules', 'dep'), { recursive: true })
+  writeFileSync(join(WS, 'node_modules', 'dep', 'hidden.js'), 'module.exports = "SHARED_NEEDLE"\n')
+  writeFileSync(join(WS, 'internal', 'play', 'visible.go'), 'var Visible = "SHARED_NEEDLE"\n')
+  const found = await fakeToolService(WS).execute({
+    name: 'grep',
+    arguments: { pattern: 'SHARED_NEEDLE', path: WS },
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(
+    found.value.matches.map(match => match.path).sort(),
+    ['internal/play/visible.go', 'node_modules/dep/hidden.js'],
+    'the harness really did return both matches, the ignored one included',
+  )
+
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('search', { query: 'SHARED_NEEDLE' })] },
+      record([{
+        severity: 'major', category: 'correctness', file: 'node_modules/dep/hidden.js', line: 1,
+        title: 'A dependency nobody asked about', problem: 'a claim built on a path the review excluded',
+        impact: 'The reviewer reports on code that was never part of the review.',
+        trigger: 'A search hit under an ignored path reaches this.',
+        suggestion: 'none', evidence: 'module.exports = "SHARED_NEEDLE"',
+      }], 'searched'),
+    ],
+  })
+  const result = await h.invoke('')
+  const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+  assert.ok(tool.content[0].text.includes('[1 match(es) for "SHARED_NEEDLE"]'), tool.content[0].text)
+  assert.ok(tool.content[0].text.includes('internal/play/visible.go:1: var Visible = "SHARED_NEEDLE"'), tool.content[0].text)
+  assert.ok(!tool.content[0].text.includes('node_modules'), 'the ignored row never becomes context')
+  const payload = payloadOf(result.text)
+  assert.deepEqual(payload.stats.context.files, ['internal/play/visible.go'], 'nor part of the evidence corpus')
+  assert.equal(payload.findings.length, 0)
+  assert.equal(payload.withheld.length, 1)
+  assert.ok(payload.withheld[0].reason.includes('not one the reviewer could see'), payload.withheld[0].reason)
+}
+
+// 112 — a harness that exposes neither read nor grep still offers the plugin's own list_dir, and each missing capability costs exactly the tool that needs it.
+{
+  const { value, warnings } = await captureWarnings(async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      toolService: false,
+      script: [
+        {
+          toolCalls: [
+            toolCall('read_file', { path: READ_ONLY_FILE }),
+            toolCall('search', { query: 'MARKER' }),
+            toolCall('list_dir', { path: 'internal' }),
+          ],
+        },
+        record([PROVEN], 'diff and a listing'),
+      ],
+    })
+    return { h, result: await h.invoke('') }
+  })
+  const h = value.h
+  assert.equal(value.result.kind, 'success', value.result.text)
+  const request = h.seen.prompts[0]
+  assert.deepEqual(
+    request.tools.map(tool => tool.name),
+    [...REVIEW_TOOL_NAMES, 'list_dir'],
+    'the review tools, plus the one reader tool that needs no harness tool',
+  )
+  assert.equal(assertOneReading(request, 'no tool service at all'), true, 'and the contract claims exactly that one')
+  assert.ok(request.system.includes('You have one read-only tool: list_dir.'), 'naming it, and it alone')
+  assert.ok(!request.system.includes('This run cannot read the project'), 'so the run is not told it cannot read')
+  const refused = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(refused.length, 3, 'every call still gets exactly one result')
+  assert.deepEqual(refused.slice(0, 2).map(message => message.isError), [true, true], 'the two tools that need the harness are refused')
+  assert.ok(refused[0].content[0].text.includes('this harness exposes no "read" tool'), refused[0].content[0].text)
+  assert.ok(refused[1].content[0].text.includes('this harness exposes no "grep" tool'), refused[1].content[0].text)
+  assert.ok(refused[1].content[0].text.includes('list_dir'), 'and a refusal names the reader tools this run does still offer')
+  assert.equal(refused[2].isError, undefined, 'while list_dir runs on the plugin itself')
+  assert.ok(refused[2].content[0].text.includes('dir  chessx'), refused[2].content[0].text)
+  assert.equal(h.tools.calls.length, 0, 'no tool the harness does not have was ever consulted')
+  assert.equal(payloadOf(value.result.text).stats.context.calls, 1, 'only the listing is a reader call')
+  assert.equal(payloadOf(value.result.text).findings.length, 1, 'a finding grounded in the diff alone still publishes')
+  assert.deepEqual(
+    warnings.filter(line => line.includes('will not be offered')),
+    [
+      '[code-review] this harness exposes no "read" tool to the run; read_file will not be offered',
+      '[code-review] this harness exposes no "grep" tool to the run; search will not be offered',
+    ],
+    `each missing capability is reported once, and list_dir is never one of them: ${warnings.join(' | ')}`,
+  )
+
+  const half = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    toolNames: ['read'],
+    script: [
+      { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE }), toolCall('search', { query: 'MARKER' })] },
+      record([], 'half a service'),
+    ],
+  })
+  const partial = await half.invoke('')
+  assert.equal(partial.kind, 'success', partial.text)
+  const halfRequest = half.seen.prompts[0]
+  assert.deepEqual(
+    halfRequest.tools.map(tool => tool.name),
+    [...REVIEW_TOOL_NAMES, 'read_file', 'list_dir'],
+    'a harness with only read keeps read_file and list_dir, and drops search',
+  )
+  // The count is written as a numeral from two on, so the word is accepted too: what the test pins is the sentence and the tools it names.
+  assert.ok(/You have (?:two|2) read-only tools: read_file and list_dir\./.test(halfRequest.system), halfRequest.system.slice(halfRequest.system.indexOf('## Reading')))
+  assert.equal(assertOneReading(halfRequest, 'a service exposing only read'), true)
+  const halfRefused = messagesOf(half.seen.prompts[1], 'tool')
+  assert.equal(halfRefused[0].isError, undefined, halfRefused[0].content[0].text)
+  assert.ok(halfRefused[0].content[0].text.includes('MARKER_NIL_SQUARES'), 'the read ran on the harness tool it has')
+  assert.equal(halfRefused[1].isError, true, 'and the search is refused for the capability it lacks')
+  assert.ok(halfRefused[1].content[0].text.includes('this harness exposes no "grep" tool'), halfRefused[1].content[0].text)
+  assert.ok(halfRefused[1].content[0].text.includes('read_file'), 'the refusal names the reader tools this run still offers')
+  assert.deepEqual(half.tools.calls.map(call => call.name), ['read'], 'only the tool the harness has was consulted')
+}
+
+// 113 — the harness's own refusals and failures are the reader's refusal reasons: a directory, a binary, a missing file and a broken tool are refused reads, never the end of the review.
+{
+  writeFileSync(join(WS, 'internal', 'chessx', 'logo.bin'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03]))
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      {
+        toolCalls: [
+          toolCall('read_file', { path: 'internal' }),
+          toolCall('read_file', { path: 'internal/chessx/logo.bin' }),
+          toolCall('read_file', { path: 'internal/chessx/gone.go' }),
+        ],
+      },
+      record([], 'nothing readable'),
+    ],
+  })
+  const result = await h.invoke('')
+  const tool = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(h.tools.calls.length, 6, 'each refusal is the harness\'s, observed twice: once for the window and once for its own default')
+  assert.deepEqual(
+    h.tools.calls.map(call => Object.hasOwn(call.arguments, 'limit')),
+    [true, false, true, false, true, false],
+    'the retry drops the limit the deployment refused, and nothing else',
+  )
+  for (const [index, reason] of ['not a regular file', 'binary file', 'not found'].entries()) {
+    assert.equal(tool[index].isError, true, tool[index].content[0].text)
+    assert.ok(tool[index].content[0].text.startsWith('cannot read '), tool[index].content[0].text)
+    assert.ok(tool[index].content[0].text.includes(reason), tool[index].content[0].text)
+  }
+  assert.equal(payloadOf(result.text).stats.context.calls, 3, 'two harness calls are one refused read, and a refused read is still a call against the budget')
+
+  const broken = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    readFails: 'the file store is offline',
+    grepFails: { throws: 'the search backend is unreachable' },
+    script: [
+      { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] },
+      { toolCalls: [toolCall('search', { query: 'MARKER_NIL_SQUARES' })] },
+      record([{ ...PROVEN, file: READ_ONLY_FILE, evidence: READ_ONLY_LINE }], 'nothing was read'),
+    ],
+  })
+  const brokenResult = await broken.invoke('')
+  assert.equal(brokenResult.kind, 'success', brokenResult.text)
+  const brokenTool = messagesOf(broken.seen.prompts[2], 'tool')
+  assert.ok(
+    brokenTool[0].content[0].text.includes(`cannot read ${READ_ONLY_FILE}: Error: the file store is offline`),
+    brokenTool[0].content[0].text,
+  )
+  assert.ok(
+    brokenTool[1].content[0].text.includes('search failed: Error: the search backend is unreachable'),
+    brokenTool[1].content[0].text,
+  )
+  assert.deepEqual(
+    brokenTool.map(message => message.isError),
+    [true, true],
+    'a tool that answers with a failure and a tool that throws are both refused calls',
+  )
+  const brokenPayload = payloadOf(brokenResult.text)
+  assert.equal(brokenPayload.findings.length, 0, 'what no tool returned is not evidence')
+  assert.equal(brokenPayload.withheld.length, 1)
+  assert.ok(brokenPayload.withheld[0].reason.includes('not one the reviewer could see'), brokenPayload.withheld[0].reason)
+}
+
+// 114 — a cancel landing while a read is running stops the run, instead of being reported as a tool that failed.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    abortOnTool: true,
+    script: [{ toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] }, record([], 'never reached')],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'error', result.text)
+  assert.ok(result.text.includes('cancelled'), result.text)
+  assert.equal(h.tools.calls.length, 1, 'the call had already reached the harness when the cancel landed')
+  assert.equal(h.seen.prompts.length, 1, 'and the run stopped there')
+}
+
+// 115 — a harness that exposes only grep keeps search and list_dir, and a read_file call is refused by the capability it lacks, not by the family.
+{
+  const { value, warnings } = await captureWarnings(async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      toolNames: ['grep'],
+      script: [
+        {
+          toolCalls: [
+            toolCall('read_file', { path: READ_ONLY_FILE }),
+            toolCall('search', { query: 'MARKER_NIL_SQUARES' }),
+            toolCall('list_dir', { path: 'internal' }),
+          ],
+        },
+        record([], 'half a service'),
+      ],
+    })
+    return { h, result: await h.invoke('') }
+  })
+  const h = value.h
+  assert.equal(value.result.kind, 'success', value.result.text)
+  const request = h.seen.prompts[0]
+  assert.deepEqual(
+    request.tools.map(tool => tool.name),
+    [...REVIEW_TOOL_NAMES, 'list_dir', 'search'],
+    'the tools this deployment can run, in the order the plugin declares them',
+  )
+  assert.ok(/You have (?:two|2) read-only tools: list_dir and search\./.test(request.system), 'and the contract names exactly those two')
+  assert.equal(assertOneReading(request, 'a service exposing only grep'), true)
+  const tool = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(tool.length, 3, 'every call of the turn got exactly one result')
+  assert.equal(tool[0].isError, true, 'the read is refused')
+  assert.ok(tool[0].content[0].text.includes('this harness exposes no "read" tool'), tool[0].content[0].text)
+  assert.ok(
+    tool[0].content[0].text.includes('list_dir') && tool[0].content[0].text.includes('search'),
+    'and the refusal names the reader tools this run does offer',
+  )
+  assert.equal(tool[1].isError, undefined, tool[1].content[0].text)
+  assert.ok(tool[1].content[0].text.includes('[1 match(es) for "MARKER_NIL_SQUARES"]'), 'search ran on the harness grep')
+  assert.equal(tool[2].isError, undefined)
+  assert.ok(tool[2].content[0].text.includes('dir  chessx'), 'and list_dir needs no harness tool at all')
+  assert.deepEqual(h.tools.calls.map(call => call.name), ['grep'], 'only the tool this deployment has was consulted')
+  assert.equal(payloadOf(value.result.text).stats.context.calls, 2, 'a refused read is not a call')
+  assert.deepEqual(
+    warnings.filter(line => line.includes('will not be offered')),
+    ['[code-review] this harness exposes no "read" tool to the run; read_file will not be offered'],
+    `the one capability this harness lacks is the one reported: ${warnings.join(' | ')}`,
+  )
+}
+
+// 116 — a deployment whose read window is capped below the review's 400 is answered by the retry: two harness calls, the second without a limit, and the read lands.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    readLimit: 200,
+    script: [
+      { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] },
+      record([{ ...PROVEN, file: READ_ONLY_FILE, line: 4, evidence: READ_ONLY_LINE }], 'read it'),
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  assert.deepEqual(
+    h.tools.calls.map(call => call.arguments),
+    [
+      { file_path: join(WS, 'internal', 'play', 'move.go'), offset: 1, limit: 400 },
+      { file_path: join(WS, 'internal', 'play', 'move.go'), offset: 1 },
+    ],
+    'the capped window is asked for once, and the retry asks for no window at all',
+  )
+  const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+  assert.equal(tool.isError, undefined, tool.content[0].text)
+  assert.ok(tool.content[0].text.includes(`[${READ_ONLY_FILE} — lines 1-5 of 5]`), tool.content[0].text)
+  assert.ok(tool.content[0].text.includes('MARKER_NIL_SQUARES'), 'the retried read returned the file')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.stats.context.calls, 1, 'two harness calls are still one reader call')
+  assert.equal(payload.findings.length, 1, 'and the finding the read grounds is published')
+
+  const within = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    readLimit: 200,
+    script: [
+      { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE, offset: 3, limit: 2 })] },
+      record([], 'windowed'),
+    ],
+  })
+  await within.invoke('')
+  assert.deepEqual(
+    within.tools.calls.map(call => call.arguments),
+    [{ file_path: join(WS, 'internal', 'play', 'move.go'), offset: 3, limit: 2 }],
+    'a window the deployment accepts is never retried',
+  )
+  assert.equal(messagesOf(within.seen.prompts[1], 'tool')[0].isError, undefined)
+}
+
+// 117 — a read that succeeds with a value the wrapper does not declare is refused, never reported as an empty file.
+{
+  for (const [readMalformed, what] of [[true, 'the lines are not a list'], ['text', 'a line carries no text'], ['totalLines', 'the total is not a whole number']]) {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      readMalformed,
+      script: [
+        { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] },
+        record([{ ...PROVEN, file: READ_ONLY_FILE, line: 4, evidence: READ_ONLY_LINE }], 'read it'),
+      ],
+    })
+    const result = await h.invoke('')
+    assert.equal(result.kind, 'success', result.text)
+    const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+    assert.equal(tool.isError, true, `${what}: ${tool.content[0].text}`)
+    assert.ok(
+      tool.content[0].text.startsWith(`cannot read ${READ_ONLY_FILE}: the harness's read returned an unexpected shape`),
+      `${what}: ${tool.content[0].text}`,
+    )
+    assert.ok(!tool.content[0].text.includes('lines 1-'), `${what}: no window is claimed for a file the run never saw`)
+    assert.equal(h.tools.calls.length, 1, `${what}: a malformed success is not a window refusal, so it is not retried`)
+    const payload = payloadOf(result.text)
+    assert.equal(payload.findings.length, 0, `${what}: nothing is evidenced by a result the wrapper cannot read`)
+    assert.equal(payload.withheld.length, 1)
+    assert.ok(
+      payload.withheld[0].reason.includes('not one the reviewer could see'),
+      `${what}: reading it as an empty file would have made the file visible — ${payload.withheld[0].reason}`,
+    )
+    assert.deepEqual(payload.stats.context.files, [], `${what}: and the file never entered the run's corpus`)
+  }
+}
+
+// 118 — a search that succeeds with a value the wrapper does not declare is a refusal, never "no match": the project was not searched to a conclusion.
+{
+  for (const [grepMalformed, what] of [[true, 'the matches are not a list'], ['row', 'a row carries no line number']]) {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      grepMalformed,
+      script: [
+        { toolCalls: [toolCall('search', { query: 'MARKER_NIL_SQUARES' })] },
+        record([], 'searched'),
+      ],
+    })
+    const result = await h.invoke('')
+    assert.equal(result.kind, 'success', result.text)
+    const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+    assert.equal(tool.isError, true, `${what}: ${tool.content[0].text}`)
+    assert.ok(
+      tool.content[0].text.startsWith("search failed: the harness's grep returned an unexpected shape"),
+      `${what}: ${tool.content[0].text}`,
+    )
+    assert.ok(!tool.content[0].text.includes('no match'), `${what}: an unreadable result is not a claim that the project holds nothing`)
+    assert.equal(h.tools.calls.length, 1, `${what}: the harness was asked exactly once`)
+    assert.equal(payloadOf(result.text).stats.context.calls, 1, `${what}: the refused search is still a call against the budget`)
+  }
 }
 
 console.log('selftest: all checks passed')
