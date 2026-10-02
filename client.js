@@ -1,22 +1,7 @@
 /**
- * dsh-code-review — Client half.
- *
- * Draws the report the Host half returns, as the renderer for the `review`
- * command row. It fetches nothing and owns no state: everything it shows
- * arrives in the command node's `outcome.text`, as a Markdown report followed by
- * one fenced JSON payload after `<!-- code-review:payload -->`. A card that
- * cannot parse the payload falls back to the raw report text.
- *
- * The card is mode-agnostic: the Host half sends the mode's label, its severity
- * vocabulary and the ordered field list of one finding, and the card draws what
- * it was sent. It knows no particular mode, so a mode a user wrote under `modes`
- * in `config.json` renders exactly like `cr` or `arc` does.
- *
- * The card is where the review is read and taken away. It renders the report and
- * offers a copy action — the whole report, or one finding — and nothing else: no
- * button sends anything to the agent, because a review is a decision aid and the
- * decision, with the instruction that follows from it, belongs to the human.
- * The report never reaches the agent by itself either; see `notifyAgent`.
+ * dsh-code-review — Client half: draws the report the Host half returns in `outcome.text` (Markdown plus one fenced
+ * JSON payload after the marker), from the mode's own labels and field list, so the card knows no particular mode.
+ * It offers copy actions only: a review is a decision aid, and the instruction that follows it belongs to the human.
  */
 window.__ModuleLoader__.load({
   id: '@local/dsh-code-review',
@@ -27,12 +12,10 @@ window.__ModuleLoader__.load({
     const NS = 'code-review'
     const MARKER = '<!-- code-review:payload -->'
 
-    /**
-     * What the card draws when a payload does not describe its mode — a payload
-     * from another release, or the raw fallback face. It carries the code-review
-     * vocabulary the plugin shipped before modes, labels included, so the card
-     * never shows a blank finding.
-     */
+    /** Shared empty node list: a selector must return a stable identity while nothing changed. */
+    const NO_NODES = []
+
+    /** What the card draws when a payload does not describe its mode — a truncated payload, or the raw fallback face — so a finding is never blank. */
     const DEFAULT_MODE = {
       id: 'cr',
       label: 'Code review',
@@ -56,10 +39,12 @@ window.__ModuleLoader__.load({
       'title': 'Code review',
       'state.running': 'Reviewing the change set…',
       'state.error': 'The review did not complete',
+      'state.partial': 'incomplete',
       'label.findings': 'Findings',
       'label.skipped': 'Left out of the review',
       'label.ignored': 'Excluded by the ignore rules',
       'label.withheld': 'Withheld as unprovable',
+      'label.incomplete': 'This review stopped early',
       'label.reviewer': 'reviewer',
       'label.thinking': 'thinking',
       'empty.findings': 'No proven findings — nothing here stands up as worth reporting.',
@@ -85,10 +70,12 @@ window.__ModuleLoader__.load({
       'title': '代码审核',
       'state.running': '正在审核本次改动…',
       'state.error': '审核未能完成',
+      'state.partial': '未完成',
       'label.findings': '问题清单',
       'label.skipped': '未纳入审核',
       'label.ignored': '被忽略规则排除',
       'label.withheld': '因无法证实而扣留',
+      'label.incomplete': '本次审核提前结束',
       'label.reviewer': '审核模型',
       'label.thinking': '思考等级',
       'empty.findings': '没有可证实的发现——这里没有值得报告的问题。',
@@ -117,6 +104,25 @@ window.__ModuleLoader__.load({
   border-radius: 10px; padding: 10px 12px; margin: 4px 0;
   font-size: 12.5px; line-height: 1.55; color: var(--dsw-alias-label-primary);
 }
+/* The composer-stack occurrence: the same card, measured and capped like the harness's own dock cards
+   (ui-goal GoalBar.module.css; the composer seat's own --dsh-composer-text-max-height), so a long report
+   scrolls inside the card instead of pushing the hero composer out of reach. */
+.dcr-dock {
+  box-sizing: border-box;
+  width: calc(
+    100% -
+    var(--dsh-composer-side-clearance, 16px) -
+    var(--dsh-composer-side-clearance, 16px) -
+    var(--dsh-composer-dock-inset, 8px) -
+    var(--dsh-composer-dock-inset, 8px) -
+    var(--dsh-composer-dock-inset, 8px) -
+    var(--dsh-composer-dock-inset, 8px)
+  );
+  max-width: calc(var(--dsh-composer-card-max-width, 952px) - 4 * var(--dsh-composer-dock-inset, 8px));
+  margin: 0 auto;
+}
+.dcr-card-dock { margin: 0; }
+.dcr-card-dock .dcr-body { max-height: var(--dsh-composer-text-max-height, 336px); overflow-y: auto; }
 .dcr-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .dcr-title { font-weight: 600; }
 .dcr-spacer { flex: 1 1 auto; }
@@ -170,9 +176,8 @@ window.__ModuleLoader__.load({
       const fence = rest.indexOf('```json')
       if (fence < 0) return undefined
       const body = rest.slice(fence + '```json'.length)
-      // The payload is the last block of the report and its own fields may
-      // contain a fence (an evidence quote from a Markdown file, for instance),
-      // so the closing fence is the last one.
+      // The payload is the report's last block and its own fields may contain a fence (an evidence quote from a
+      // Markdown file), so the closing fence is the last one.
       const end = body.lastIndexOf('```')
       if (end < 0) return undefined
       try {
@@ -183,11 +188,8 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /**
-     * Which face the card shows for one command outcome, and the payload behind
-     * it. A command that succeeded but whose payload did not parse is `unparsed`,
-     * not `error`: the review did run, and saying otherwise is a lie.
-     */
+    /** Which face the card shows for one outcome, and the payload behind it. A run that succeeded but whose payload
+     * did not parse is `unparsed`, not `error`: the review did run, and saying otherwise is a lie. */
     function readOutcome(outcome) {
       if (outcome === null || outcome === undefined) return { face: 'running', payload: undefined }
       if (outcome.kind !== 'success') return { face: 'error', payload: undefined }
@@ -197,25 +199,45 @@ window.__ModuleLoader__.load({
         : { face: 'report', payload }
     }
 
-    /** The Markdown report without the machine payload that follows it. */
+    /** Whether the shell draws no transcript for this Session at all, which is the one case the dock card exists for.
+     * This is the shell's own gate, not a guess: `conversationPhase` (ui-conversation contract/snapshot.ts) calls a
+     * Session active when a Conversation target contributes visible activity, a Turn runs, or the conversation has
+     * started, and `DefaultConversationViews` then renders nothing while `session.blank && phase === 'blank'`.
+     * A Chat whose only rows are commands is deliberately NOT activity (chat-snapshot-builder.ts `isActive`), and a
+     * command lifecycle never opens a Turn — so a report asked for on a fresh session has nowhere to land today.
+     * With `blank === true` the phase reduces to "no active target, no running Turn, no attempted prompt". */
+    function transcriptHidden(session, activeTargetCount) {
+      if (session?.blank !== true) return false
+      if (session.running === true) return false
+      if (session.promptAttempted === true) return false
+      if (activeTargetCount > 0) return false
+      return true
+    }
+
+    /** The newest folded `/review` lifecycle in the Chat snapshot, or undefined when this session never ran one —
+     * the same CommandNode the transcript row hands the card, read from the one place a client sees it (`legacy.nodes`,
+     * the finalized node stream). An error settles here too: a failed review is the answer the reader asked for. */
+    function latestReviewCommand(nodes) {
+      if (!Array.isArray(nodes)) return undefined
+      for (let index = nodes.length - 1; index >= 0; index -= 1) {
+        const node = nodes[index]
+        if (node?.kind === 'command' && node.name === 'review') return node
+      }
+      return undefined
+    }
+
     function reportOf(text) {
       if (typeof text !== 'string') return ''
       const marker = text.indexOf(MARKER)
       return (marker < 0 ? text : text.slice(0, marker)).trimEnd()
     }
 
-    /** `file:line` of one finding, or an empty string when it names no file. */
     function whereOf(finding) {
       const file = typeof finding?.file === 'string' ? finding.file : ''
       if (file === '') return ''
       return `${file}${Number.isInteger(finding?.line) ? `:${finding.line}` : ''}`
     }
 
-    /**
-     * The mode a payload describes: the fields, their labels and the severity
-     * vocabulary the Host half sent with the report. The card knows nothing about
-     * any particular mode, so a mode a user wrote renders like a built-in one.
-     */
     function modeOf(payload) {
       const mode = payload?.mode
       if (mode === null || typeof mode !== 'object' || !Array.isArray(mode.fields)) return DEFAULT_MODE
@@ -230,7 +252,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** How one severity is named and toned, for the chip and the withheld list. */
     function severityOf(mode, id) {
       const found = mode.severities.find(entry => entry.id === id)
       if (found !== undefined) {
@@ -239,11 +260,7 @@ window.__ModuleLoader__.load({
       return { id, label: typeof id === 'string' ? id : '?', tone: 'muted' }
     }
 
-    /**
-     * One finding as the report itself words it, so a copy pastes cleanly
-     * elsewhere. The body is the mode's own field list, in its order: a `block`
-     * field is fenced, an empty label renders the text bare.
-     */
+    /** One finding as the report itself words it — the mode's own field list in its order — so a copy pastes cleanly elsewhere. */
     function findingText(finding, index, mode = DEFAULT_MODE) {
       const where = whereOf(finding)
       const severity = severityOf(mode, finding?.severity)
@@ -263,7 +280,6 @@ window.__ModuleLoader__.load({
       return lines.join('\n')
     }
 
-    /** Clipboard write, with the selection fallback for a context without the async API. */
     async function copyText(text) {
       try {
         if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText !== undefined) {
@@ -325,11 +341,7 @@ window.__ModuleLoader__.load({
       return parts.join(' · ')
     }
 
-    /**
-     * A button that puts `text` on the clipboard and reports the outcome for a
-     * moment. The timer lives in a state-initialized box so no extra hook is
-     * needed, and a failed copy says so instead of silently doing nothing.
-     */
+    /** Puts `text` on the clipboard and reports the outcome for a moment; the timer lives in a state box, so no extra hook, and a failed copy says so. */
     function CopyButton({ text, label, t }) {
       const [state, setState] = React.useState('idle')
       const [box] = React.useState(() => ({ timer: null }))
@@ -349,11 +361,6 @@ window.__ModuleLoader__.load({
       }, t(shown))
     }
 
-    /**
-     * The row under one finding. It copies and nothing else: a review is a
-     * decision aid, and the decision — and the instruction that follows from it —
-     * belongs to the human, who hands it to the agent in their own words.
-     */
     function findingActions(finding, index, t, mode) {
       return h('div', { className: 'dcr-actions', key: 'actions' }, [
         h(CopyButton, {
@@ -366,11 +373,6 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    /**
-     * One finding, drawn from the field list its mode declared: the chip is the
-     * mode's name for the severity, the body is the mode's fields in the mode's
-     * order, and a field the mode marked `block` is quoted code.
-     */
     function findingRow(finding, index, t, mode) {
       const where = whereOf(finding)
       const severity = severityOf(mode, finding.severity)
@@ -417,11 +419,8 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    /**
-     * What the ignore rules took out of the change set, with the rule that took
-     * it. The count is the truth and the list is a sample, so a report never
-     * grows a dependency tree it was asked to leave out.
-     */
+    /** What the ignore rules took out of the change set, with the rule that took it. The count is the truth
+     * and the list is a sample, so a report never grows the dependency tree it was asked to leave out. */
     function ignoredList(ignore, t) {
       const sample = Array.isArray(ignore?.sample) ? ignore.sample : []
       if (sample.length === 0) return null
@@ -456,18 +455,20 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    function ReviewCard({ node, t }) {
+    function ReviewCard({ node, t, dock = false }) {
       const outcome = node?.outcome ?? null
       const [open, setOpen] = React.useState(true)
       const view = React.useMemo(() => readOutcome(outcome), [outcome])
       const { face, payload } = view
+      // One card, two seats: the transcript row draws it as it always has, the composer dock caps its body.
+      const cardClass = dock ? 'dcr-card dcr-card-dock' : 'dcr-card'
 
       const toggle = h('button', {
         className: 'dcr-toggle', type: 'button', onClick: () => setOpen(value => !value),
       }, t(open ? 'toggle.hide' : 'toggle.show'))
 
       if (face === 'running') {
-        return h('div', { className: 'dcr-card' }, [
+        return h('div', { className: cardClass }, [
           h('style', { key: 'css' }, CSS),
           head(t('title'), [chip(t('state.running'), 'muted', 'run')], null),
         ])
@@ -475,7 +476,7 @@ window.__ModuleLoader__.load({
 
       if (face === 'error' || face === 'unparsed') {
         const raw = String(outcome.text ?? '')
-        return h('div', { className: 'dcr-card' }, [
+        return h('div', { className: cardClass }, [
           h('style', { key: 'css' }, CSS),
           head(
             t('title'),
@@ -491,29 +492,37 @@ window.__ModuleLoader__.load({
       const findings = Array.isArray(payload.findings) ? payload.findings : []
       const mode = modeOf(payload)
       const reviewer = payload.reviewer
-      // The level is shown only when the run asked for one: a review that left
-      // the choice to the provider says nothing rather than claiming a level.
+      // The level is shown only when the run asked for one: a review that left the choice to the provider says nothing rather than claiming a level.
       const thinking = typeof reviewer?.reasoningEffort === 'string' && reviewer.reasoningEffort !== ''
         ? ` · ${t('label.thinking')} ${reviewer.reasoningEffort}`
         : ''
       const subtitle = `${countLine(payload, t, mode)}${reviewer ? ` · ${t('label.reviewer')} ${reviewer.provider}/${reviewer.model}${thinking}` : ''}`
-      // The verdict chip says the mode's own word for the answer — `fail` for a
-      // code review, `decide before merge` for an architecture review — while the
-      // tone stays the machine verdict, so the card reads the same at a glance.
+      // The verdict chip says the mode's own word for the answer — `fail` for a code review, `decide before merge`
+      // for an architecture review — while the tone stays the machine verdict, so the card reads the same at a glance.
       const verdictLabel = payload.mode?.verdict?.label ?? mode.verdicts[payload.verdict] ?? payload.verdict ?? 'pass'
+      // A review the run stopped early still reaches the reader, with the reason it is short, so nobody reads a partial list as a complete answer.
+      const incomplete = typeof payload.incomplete === 'string' && payload.incomplete !== ''
+        ? payload.incomplete
+        : undefined
 
-      return h('div', { className: 'dcr-card' }, [
+      return h('div', { className: cardClass }, [
         h('style', { key: 'css' }, CSS),
         head(
           mode.label,
-          [chip(String(verdictLabel), toneOf(payload.verdict), 'verdict')],
+          [
+            chip(String(verdictLabel), toneOf(payload.verdict), 'verdict'),
+            ...(incomplete === undefined ? [] : [chip(t('state.partial'), 'warn', 'partial')]),
+          ],
           [
             h(CopyButton, { key: 'copy', text: reportOf(outcome.text), label: 'action.copyReport', t }),
             toggle,
           ],
         ),
         h('div', { className: 'dcr-meta', key: 'meta' }, subtitle),
-        open ? h('div', { key: 'body' }, [
+        incomplete === undefined
+          ? null
+          : h('div', { className: 'dcr-meta', key: 'incomplete' }, `${t('label.incomplete')}: ${incomplete}`),
+        open ? h('div', { className: 'dcr-body', key: 'body' }, [
           payload.summary
             ? h('div', { className: 'dcr-summary', key: 'summary' }, payload.summary)
             : null,
@@ -530,10 +539,28 @@ window.__ModuleLoader__.load({
       ])
     }
 
+    /** The composer-stack occurrence: the same card, drawn only while the shell draws no transcript for this
+     * Session. Hooks run first and on every render; the two decisions after them are pure. */
+    function ReviewDock({ session, useChat, useConversation, t }) {
+      const nodes = useChat(value => value?.legacy?.nodes ?? NO_NODES)
+      const activity = useConversation(value => value?.activeTargets?.size ?? 0)
+      if (!transcriptHidden(session, activity)) return null
+      const node = latestReviewCommand(nodes)
+      if (node === undefined) return null
+      return h('div', { className: 'dcr-dock' }, h(ReviewCard, { node, t, dock: true }))
+    }
+
+    /** Seat adapter. A shell that composes no Chat standard source has nothing to stand in for, and this
+     * component calls no hook itself, so a late source mounts ReviewDock rather than changing its hook count. */
+    function Dock(props) {
+      if (typeof props.useChat !== 'function' || typeof props.useConversation !== 'function') return null
+      return h(ReviewDock, props)
+    }
+
     return {
       inject: ['slots', 'locale'],
       /** Loaded by the self-test, which imports this artifact with a stub React. */
-      __test: { parsePayload, readOutcome, reportOf, findingText, modeOf, severityOf },
+      __test: { parsePayload, readOutcome, reportOf, findingText, modeOf, severityOf, transcriptHidden },
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, 'en', en), 'code-review: en dictionary')
         ctx.effect(() => ctx.locale.register(NS, 'zh', zh), 'code-review: zh dictionary')
@@ -545,6 +572,15 @@ window.__ModuleLoader__.load({
           key: 'review',
           locale: NS,
         }, Card))
+        // The second seat: a report asked for on a Session whose first Turn has not started has no transcript
+        // row to land on, so the same card stands in above the composer until the conversation does.
+        const DockSeat = props => h(Dock, { ...props, t })
+        ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+          name: 'conversation.input.dock',
+          id: 'code-review',
+          order: 30,
+          locale: NS,
+        }, DockSeat))
       },
     }
   },

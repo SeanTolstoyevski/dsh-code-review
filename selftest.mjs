@@ -1,21 +1,11 @@
 /**
- * Self-test for both halves: drives the `/review` handler against a fake Context
- * and asserts the whole path — diff collection, the read-only project reader
- * (tools, budget, sandbox), the evidence gate, the modes and the settings file,
- * the notice that reaches the Agent when it is opted in, and every failure mode.
- * It then loads the Client artifact and asserts the card's copy helpers, its
- * mode-driven body and its outcome faces.
- *
- * The reviewer model is scripted: each entry answers one model call, either with
- * text or with tool calls, so the loop is exercised without a network call.
- *
- * Run: node selftest.mjs
+ * Self-test for both halves — the `/review` path against a stub Context, then the loaded Client card. Run: node selftest.mjs
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { apply, BUILT_IN_MODES, DEFAULTS } from './index.js'
 
@@ -24,9 +14,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const SESSION = 'session-under-test'
 const MARKER = '<!-- code-review:payload -->'
 
-// Hermetic by construction: the run must never read the developer's real
-// DSH_HOME/code-review/config.json, or the settings on this machine would decide
-// what the assertions mean. `withSettings` layers a per-test file on top.
+// Hermetic: the run must never read the developer's real DSH_HOME/code-review/config.json, or this machine's settings would decide what the assertions mean.
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-code-review-home-'))
 
 // A real workspace, because the reader tools touch the filesystem.
@@ -62,48 +50,65 @@ writeFileSync(
 const READ_ONLY_LINE = 'b.Reset() // MARKER_NIL_SQUARES'
 const READ_ONLY_FILE = 'internal/play/move.go'
 
-/**
- * A Context stub exposing only what the plugin body touches.
- * @param options.summary - what `workspaceChanges.summary` returns.
- * @param options.summaries - per-seq summaries instead, so a dropped record can be simulated.
- * @param options.events - the recorded `workspace/changes` seqs in log order (oldest first).
- * @param options.diffs - what `workspaceChanges.diff` returns, by file index.
- * @param options.script - one entry per model call: `{ text }` or `{ toolCalls }`; the last entry repeats.
- * @param options.hasEvent - whether the session recorded a `workspace/changes` event.
- * @param options.route - the agent's own route, as real Agents expose it; `{}` means no route is known.
- * @param options.steerThrows - makes `agent.steer` reject, to prove the report survives.
- * @param options.failFirstWithTools - makes the first model call throw, to prove the diff-only retry.
- * @param options.git - expose a real `ctx.subprocess`, so the git source can run.
- * @param options.cwd - the session workspace the plugin reads.
- * @param options.messages - what the session derives as its conversation.
- * @param options.toolCalls - `{ name, arguments }` entries logged as this session's tool calls.
- * @param options.modelInfo - what `ctx.llm.resolveModelInfo` returns; omitted exposes no such method.
- * @param options.modelInfoThrows - makes `resolveModelInfo` reject, as an unregistered route does.
- */
+/** A Context stub exposing only what the plugin body touches; `script` answers one model call per entry, its last repeating.
+ * `failAtCall` and `abortAtCall` are 1-based, and `failAtCall` may name a list of calls to fail.
+ * `toolService: false` exposes no harness tool service at all, while `toolNames` decides which of the harness's
+ * `read`/`grep` it exposes. `readFails`/`grepFails` make that tool fail — a message or `true` for an error result,
+ * `{ throws: message }` for a call that throws instead; `readLimit` caps the window `read` accepts, so a call asking
+ * for more is refused while a call without a `limit` is served; `readMalformed`/`grepMalformed` make a call that
+ * succeeds answer with a `value` the wrapper does not declare (`'lines'`/`'text'`/`'totalLines'` for `read`,
+ * `'matches'`/`'row'` for `grep`, `true` meaning the first); `readPath: 'relative'` makes `read` report a relative
+ * `value.path`, where the real backend reports the absolute spelling it resolved; `abortOnTool` cancels the command
+ * while a tool is running, which is a cancel landing mid-read. */
 function harness({
   summary,
   summaries,
   events = [7],
   diffs,
-  script = [{ text: '{"verdict":"pass","summary":"ok","findings":[]}' }],
+  script = [record([], 'ok')],
   hasEvent = true,
   route = { options: { provider: 'deepseek-official', model: 'deepseek-flash' } },
   steerThrows = false,
-  failFirstWithTools = false,
+  failAtCall = 0,
+  failWith = 'the stream broke',
+  abortAtCall = 0,
   git = true,
   cwd = WS,
   messages = [{ role: 'user', content: [{ type: 'text', text: 'Board ı hesapla' }] }],
   toolCalls = [],
   modelInfo,
   modelInfoThrows = false,
+  toolService = true,
+  toolNames = ['read', 'grep'],
+  readFails = false,
+  grepFails = false,
+  readLimit,
+  readMalformed = false,
+  grepMalformed = false,
+  readPath = 'absolute',
+  abortOnTool = false,
 }) {
   const subprocess = git ? realSubprocess() : undefined
   const seen = { prompts: [], steer: [], inject: [], steerAttempts: 0, modelInfo: [] }
+  const controller = new AbortController()
+  const tools = fakeToolService(cwd, {
+    names: toolNames,
+    readFails,
+    grepFails,
+    readLimit,
+    readMalformed,
+    grepMalformed,
+    readPath,
+    onCall: () => { if (abortOnTool) controller.abort() },
+  })
   let definition
   let call = 0
   const ctx = {
     effect(callback) { callback() },
-    get(name) { return name === 'subprocess' ? subprocess : undefined },
+    get(name) {
+      if (name === 'subprocess') return subprocess
+      return name === 'tools' && toolService ? tools : undefined
+    },
     commands: { register(value) { definition = value; return () => {} } },
     workspaceChanges: {
       summary: (_id, seq) => (summaries === undefined ? summary : summaries[seq]),
@@ -118,12 +123,19 @@ function harness({
         },
       },
       stream(request) {
-        seen.prompts.push(request)
+        // Each recorded request keeps the message list as it was sent, so an assertion about one call
+        // means what that call actually saw.
+        seen.prompts.push({ ...request, messages: [...request.messages] })
         const step = script[Math.min(call, script.length - 1)]
-        const failing = failFirstWithTools && call === 0
         call += 1
+        const failing = Array.isArray(failAtCall) ? failAtCall.includes(call) : failAtCall === call
+        const aborting = abortAtCall === call
         return (async function* generate() {
-          if (failing) throw new Error('this model has no tool support')
+          if (aborting) {
+            controller.abort()
+            throw new Error('the run was aborted')
+          }
+          if (failing) throw new Error(failWith)
           if (Array.isArray(step.toolCalls)) {
             for (const [index, tool] of step.toolCalls.entries()) {
               const id = `call-${call}-${index}`
@@ -169,15 +181,11 @@ function harness({
     inject(message) { seen.inject.push(message) },
   }
   const invoke = rawInput => definition.handler({
-    commandId: 'c1', agent, rawInput, attachments: [], signal: new AbortController().signal,
+    commandId: 'c1', agent, rawInput, attachments: [], signal: controller.signal,
   })
-  return { invoke, seen, name: definition.name, definition }
+  return { invoke, seen, name: definition.name, definition, tools }
 }
 
-/**
- * The `ctx.subprocess` face the plugin uses, backed by a real child process so
- * the git source is exercised against real repositories and real output.
- */
 function realSubprocess() {
   const reader = text => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
   return {
@@ -205,12 +213,173 @@ function realSubprocess() {
   }
 }
 
-/** `DSH_HOME/code-review/config.json` for a harness home a test created. */
+/**
+ * The harness's own `read` and `grep`, over the real workspace, shaped like the
+ * results the plugin's wrappers are written against: a failure is an `isError`
+ * result whose first text block carries the message, a success carries the
+ * `value` the wrapper reads. Faithful where it matters — the window is 1-based
+ * and numbered, `totalLines` is the whole file, `read` reports the absolute path
+ * it resolved, grep takes a regular expression and skips binary files, and a path
+ * outside the workspace, a directory, a binary file and a missing file are
+ * refused rather than read — and every call is recorded so a test can prove what
+ * reached the harness and what never did. `readFails`/`grepFails` break one tool
+ * (`{ throws: message }` throws instead of returning the error result), `readLimit`
+ * is the window `read` accepts at most (a larger `limit` is refused; a call that
+ * sends no `limit` is served the deployment's own default), `readMalformed` and
+ * `grepMalformed` turn a success into a `value` the wrapper cannot read, and
+ * `onCall` runs just before each call is served.
+ */
+function fakeToolService(workspace, { names = ['read', 'grep'], readFails = false, grepFails = false, readLimit, readMalformed = false, grepMalformed = false, readPath = 'absolute', onCall } = {}) {
+  const calls = []
+  let root = resolve(workspace)
+  try {
+    root = realpathSync(root)
+  } catch {
+    // A workspace that does not exist yet is still a boundary; the lexical root names it.
+  }
+  const failure = message => ({ isError: true, error: { message }, content: [{ type: 'text', text: `Error: ${message}` }] })
+  const shown = path => relative(root, path).replace(/\\/g, '/')
+  const escapes = path => {
+    const lexical = relative(root, resolve(root, path))
+    if (lexical !== '' && (lexical.startsWith('..') || isAbsolute(lexical))) return true
+    try {
+      const physical = relative(root, realpathSync(resolve(root, path)))
+      return physical !== '' && (physical.startsWith('..') || isAbsolute(physical))
+    } catch {
+      return false
+    }
+  }
+  function read(args) {
+    const requested = String(args.file_path ?? '')
+    if (requested.trim() === '') return failure('file_path must be a non-empty string')
+    const target = resolve(root, requested)
+    if (escapes(target)) return failure(`"${requested}" is outside the workspace`)
+    let stat
+    try {
+      stat = statSync(target)
+    } catch {
+      return failure(`cannot read "${shown(target)}": not found`)
+    }
+    if (!stat.isFile()) return failure(`cannot read "${shown(target)}": not a regular file`)
+    let content
+    try {
+      content = readFileSync(target, 'utf8')
+    } catch (error) {
+      return failure(`cannot read "${shown(target)}": ${error?.code ?? String(error)}`)
+    }
+    if (content.includes('\u0000')) return failure(`cannot read "${shown(target)}": binary file`)
+    const raw = content.split('\n')
+    const fileLines = (raw.at(-1) === '' ? raw.slice(0, -1) : raw).map(line => (line.endsWith('\r') ? line.slice(0, -1) : line))
+    const offset = Number.isInteger(args.offset) && args.offset > 0 ? args.offset : 1
+    // A deployment may cap the window it reads without publishing the cap among the tool's
+    // parameters: asking for more is the refusal the review retries without a `limit`.
+    if (readLimit !== undefined && Number.isInteger(args.limit) && args.limit > readLimit) {
+      return failure(`"limit" ${args.limit} is over the ${readLimit} lines this harness reads at most`)
+    }
+    const asked = Number.isInteger(args.limit) && args.limit > 0 ? args.limit : (readLimit ?? 2000)
+    const limit = readLimit === undefined ? asked : Math.min(asked, readLimit)
+    if (offset > fileLines.length && !(fileLines.length === 0 && offset === 1)) {
+      return failure(`offset ${offset} is out of range for "${shown(target)}" (${fileLines.length} lines)`)
+    }
+    const lines = fileLines.slice(offset - 1, offset - 1 + limit).map((text, index) => ({ number: offset + index, text }))
+    // The real `read` reports the path its backend resolved, which is absolute for the absolute `file_path` the wrapper sends.
+    const reported = readPath === 'relative' ? shown(target) : target
+    if (readMalformed !== false) {
+      const shape = readMalformed === true ? 'lines' : readMalformed
+      const values = {
+        lines: { path: reported, offset, lines: `${lines.length} line(s)`, totalLines: fileLines.length },
+        text: { path: reported, offset, lines: lines.map(line => ({ number: line.number, text: line.number })), totalLines: fileLines.length },
+        totalLines: { path: reported, offset, lines, totalLines: String(fileLines.length) },
+      }
+      return { isError: false, value: values[shape], content: [{ type: 'text', text: '[the harness answered with a shape it does not declare]' }] }
+    }
+    return {
+      isError: false,
+      value: { path: reported, offset, lines, totalLines: fileLines.length },
+      content: [{ type: 'text', text: lines.map(line => `${line.number}: ${line.text}`).join('\n') }],
+    }
+  }
+
+  function grep(args, signal) {
+    let pattern
+    try {
+      pattern = new RegExp(String(args.pattern ?? ''))
+    } catch (error) {
+      return failure(`regex parse error: ${error.message}`)
+    }
+    const where = String(args.path ?? '')
+    const base = where.trim() === '' ? root : resolve(root, where)
+    if (escapes(base)) return failure(`"${where}" is outside the workspace`)
+    const matches = []
+    const walk = directory => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        signal?.throwIfAborted?.()
+        const path = join(directory, entry.name)
+        if (entry.isDirectory()) {
+          walk(path)
+          continue
+        }
+        if (!entry.isFile()) continue
+        let content
+        try {
+          content = readFileSync(path, 'utf8')
+        } catch {
+          continue
+        }
+        // ripgrep searches text and leaves binary files alone.
+        if (content.includes('\u0000')) continue
+        for (const [index, line] of content.split('\n').entries()) {
+          const text = line.endsWith('\r') ? line.slice(0, -1) : line
+          if (pattern.test(text)) matches.push({ path: shown(path), lineNumber: index + 1, line: text })
+        }
+      }
+    }
+    try {
+      walk(base)
+    } catch (error) {
+      return failure(`cannot search "${shown(base)}": ${error?.code ?? String(error)}`)
+    }
+    if (grepMalformed !== false) {
+      const shape = grepMalformed === true ? 'matches' : grepMalformed
+      const values = {
+        matches: { matches: `${matches.length} match(es)` },
+        row: { matches: matches.map(match => ({ path: match.path, line: match.line })) },
+      }
+      return { isError: false, value: values[shape], content: [{ type: 'text', text: '[the harness answered with a shape it does not declare]' }] }
+    }
+    return {
+      isError: false,
+      value: { matches },
+      content: [{ type: 'text', text: matches.map(match => `${match.path}:${match.lineNumber}: ${match.line}`).join('\n') }],
+    }
+  }
+
+  return {
+    calls,
+    get(name) {
+      return names.includes(name) ? { name, description: `the harness's ${name} tool` } : undefined
+    },
+    async execute({ name, arguments: args, signal }) {
+      calls.push({ name, arguments: args })
+      onCall?.(name)
+      signal?.throwIfAborted?.()
+      const broken = name === 'read' ? readFails : name === 'grep' ? grepFails : false
+      if (broken !== false) {
+        const message = typeof broken === 'string' ? broken : `the ${name} tool failed`
+        if (typeof broken === 'object' && broken !== null) throw new Error(typeof broken.throws === 'string' ? broken.throws : message)
+        return failure(message)
+      }
+      if (name === 'read') return read(args ?? {})
+      if (name === 'grep') return grep(args ?? {}, signal)
+      return failure(`no tool named "${name}" is available to this run`)
+    },
+  }
+}
+
 function settingsPath(home) {
   return join(home, 'code-review', 'config.json')
 }
 
-/** Run `fn` with `DSH_HOME` pointed at `home`, restoring the previous value after. */
 async function withDshHome(home, fn) {
   const previous = process.env.DSH_HOME
   process.env.DSH_HOME = home
@@ -222,7 +391,6 @@ async function withDshHome(home, fn) {
   }
 }
 
-/** Run `fn` with `DSH_HOME` pointed at a fresh directory holding this config. */
 async function withSettings(settings, fn) {
   const home = mkdtempSync(join(tmpdir(), 'dsh-code-review-home-'))
   mkdirSync(join(home, 'code-review'), { recursive: true })
@@ -230,40 +398,10 @@ async function withSettings(settings, fn) {
   return withDshHome(home, fn)
 }
 
-/** Run `fn` with `DSH_HOME` pointed at a fresh directory that holds no settings file at all. */
 async function withEmptyHome(fn) {
   return withDshHome(mkdtempSync(join(tmpdir(), 'dsh-code-review-home-')), fn)
 }
 
-/**
- * The settings block README documents. The file the plugin creates on a fresh
- * machine and the block a user reads there must not drift apart, so the test
- * asserts one against the other.
- */
-function readmeDefaults() {
-  const readme = readFileSync(join(HERE, 'README.md'), 'utf8')
-  const section = readme.slice(readme.indexOf('## Configuration'))
-  const fence = section.indexOf('```json')
-  assert.ok(fence >= 0, 'README documents the settings file as a JSON block')
-  const body = section.slice(fence + '```json'.length)
-  return JSON.parse(body.slice(0, body.indexOf('```')))
-}
-
-/**
- * The mode entry README documents — one key per thing a mode can decide. The
- * built-in modes and the entries a fresh file gets must match it key for key,
- * so a reader can trust the table without reading this file.
- */
-function readmeModeShape() {
-  const readme = readFileSync(join(HERE, 'README.md'), 'utf8')
-  const section = readme.slice(readme.indexOf('## Modes'))
-  const fence = section.indexOf('```json')
-  assert.ok(fence >= 0, 'README documents a mode entry as a JSON block')
-  const body = section.slice(fence + '```json'.length)
-  return JSON.parse(body.slice(0, body.indexOf('```')))
-}
-
-/** Run `fn` with `console.warn` collected; every plugin diagnostic goes through it. */
 async function captureWarnings(fn) {
   const warnings = []
   const original = console.warn
@@ -275,7 +413,6 @@ async function captureWarnings(fn) {
   }
 }
 
-/** The payload the Client half parses out of the report text. */
 function payloadOf(text) {
   const marker = text.indexOf(MARKER)
   assert.ok(marker >= 0, 'report carries the payload marker')
@@ -283,9 +420,27 @@ function payloadOf(text) {
   return JSON.parse(body.slice(0, body.indexOf('```')))
 }
 
-/** Messages of one model call, by role. */
 function messagesOf(request, role) {
   return request.messages.filter(message => message.role === role)
+}
+
+/** The reader tools the contract's reading section names, in its own order, or none when it says this run cannot read. */
+function readersInContract(system) {
+  if (system.includes('This run cannot read the project')) return []
+  const match = /You have (?:one|two|three|\d+) read-only tools?: ([^.]+)\./.exec(system)
+  assert.ok(match !== null, 'the contract carries a reading section')
+  return match[1].replace(' and ', ', ').split(', ')
+}
+
+// A call's contract and its tool list are one decision: the tools the contract names are exactly the reader tools the request offers, so a run is never described as one it is not.
+function assertOneReading(request, what) {
+  const offered = request.tools.filter(tool => READER_TOOL_NAMES.includes(tool.name)).map(tool => tool.name)
+  assert.deepEqual(
+    readersInContract(request.system),
+    offered,
+    `the contract and the tool list describe one run (${what})`,
+  )
+  return offered.length > 0
 }
 
 const TEXT_DIFF = {
@@ -309,7 +464,6 @@ const PROVEN = {
   trigger: 'A game replayed from a PGN whose last move is incomplete reaches ApplyMove with a nil board.',
   evidence: '+new',
 }
-/** The same proof, in the vocabulary the architecture mode declares. */
 const ARC_FINDING = {
   severity: 'high', category: 'responsibility', file: 'internal/chessx/board.go', line: 13,
   title: 'Move the reset out of Apply', problem: 'Apply resets a board it does not own',
@@ -317,13 +471,26 @@ const ARC_FINDING = {
   alternative: 'Let the caller reset the board before Apply is called.',
   evidence: '+new',
 }
-/** A model reply carrying one payload. */
-const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ verdict, summary, findings }) })
+const toolCall = (name, args) => ({ name, arguments: JSON.stringify(args ?? {}) })
 
-// 1 — a proven finding survives the gate and reaches both the report and the
-// payload, in the default mode's own vocabulary.
+// One model turn: record these findings, record the summary, finish the review. `summary: null`
+// records none, and `finish: false` leaves the review open — how a model that stops mid-review is scripted.
+const record = (findings = [], summary = 'x', { finish = true, more = [] } = {}) => ({
+  toolCalls: [
+    ...findings.map(finding => toolCall('append_finding', finding)),
+    ...(summary === null ? [] : [toolCall('set_summary', { summary })]),
+    ...more,
+    ...(finish ? [toolCall('finish_review', {})] : []),
+  ],
+})
+
+// The review tools every run offers, in the order it offers them: the protocol the report is built from.
+const REVIEW_TOOL_NAMES = ['append_finding', 'update_finding', 'delete_finding', 'list_findings', 'set_summary', 'finish_review']
+const READER_TOOL_NAMES = ['read_file', 'list_dir', 'search']
+
+// 1 — a proven finding survives the gate and reaches both the report and the payload.
 {
-  const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('fail', [PROVEN], 'Nil board.')] })
+  const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([PROVEN], 'Nil board.')] })
   assert.equal(h.name, 'review')
   const result = await h.invoke('')
   assert.equal(result.kind, 'success')
@@ -335,9 +502,19 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   const system = h.seen.prompts[0].system
   assert.ok(system.includes('senior code reviewer'), 'the cr persona is the default one')
   assert.ok(system.includes('"impact"') && system.includes('"trigger"'), 'and its fields are the contract’s')
-  assert.ok(system.includes('"blocker"|"major"|"minor"|"nit"'), 'with its severity vocabulary in the JSON shape')
   assert.ok(system.includes('## Evidence bar'), 'and the gate no mode can change')
   assert.ok(system.includes('error-handling'), 'and its categories')
+  const append = h.seen.prompts[0].tools.find(tool => tool.name === 'append_finding')
+  assert.deepEqual(
+    append.parameters.properties.severity.enum,
+    ['blocker', 'major', 'minor', 'nit'],
+    'the mode’s severity vocabulary is the enum the tool accepts',
+  )
+  assert.deepEqual(
+    append.parameters.required,
+    ['severity', 'file', 'title', 'problem', 'impact', 'trigger', 'evidence'],
+    'and the fields the mode requires are the ones a call states',
+  )
   const payload = payloadOf(result.text)
   assert.equal(payload.schema, 'code-review/2')
   assert.equal(payload.mode.id, 'cr')
@@ -345,31 +522,62 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   assert.equal(payload.findings.length, 1)
   assert.equal(payload.findings[0].evidence, '+new')
   assert.deepEqual(payload.withheld, [])
+  assert.equal(payload.incomplete, null, 'a review that finished on its own terms is not partial')
   assert.equal(payload.stats.reviewed, 1)
   assert.deepEqual(payload.stats.skipped, [{ file: 'assets/logo.png', reason: 'binary' }])
+  assert.deepEqual(payload.stats.store, { calls: 3, appended: 1, updated: 0, deleted: 0 }, 'the store counts what it recorded')
   assert.ok(result.text.includes('**Evidence:**'), 'the report shows the evidence')
   assert.ok(result.text.includes(`**Fix:** ${PROVEN.suggestion}`), 'and labels the fields the mode declared')
   assert.ok(result.text.includes(PROVEN.problem), 'the statement it leads with needs no label')
+  assert.ok(result.text.includes('- finding store: 3 tool call(s), 1 recorded, 0 updated, 0 deleted'), 'the report names the store')
 }
 
-// 2 — a reviewer that contradicts itself is reconciled from its own findings.
+// 2 — the verdict is computed from the store, never declared; a finding that cannot name itself takes its title from the first field it stated.
 {
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('pass', [{ ...PROVEN, severity: 'major', title: '', evidence: '+extra' }], 'fine')],
+    script: [
+      {
+        toolCalls: [
+          toolCall('append_finding', { ...PROVEN, severity: 'major', title: '', evidence: '+extra' }),
+          toolCall('set_summary', { summary: 'fine' }),
+          toolCall('finish_review', { verdict: 'pass' }),
+        ],
+      },
+      { toolCalls: [toolCall('finish_review', {})] },
+    ],
   })
-  const payload = payloadOf((await h.invoke('')).text)
-  assert.equal(payload.verdict, 'fail', 'a proven major finding forces fail')
+  const result = await h.invoke('')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.verdict, 'fail', 'a proven major finding forces fail whatever the model says')
   assert.equal(payload.findings[0].title, 'board may be nil here', 'a missing title falls back to the problem')
+  const refusals = messagesOf(h.seen.prompts[1], 'tool').filter(message => message.isError === true)
+  assert.equal(refusals.length, 1, 'the finish_review call carrying a verdict is refused')
+  assert.ok(refusals[0].content[0].text.includes('takes no arguments'), refusals[0].content[0].text)
 }
 
-// 3 — output that is not JSON fails loudly instead of reporting a fake pass.
+// 3 — a reviewer that records nothing and never finishes is an error, never a report that looks like a pass.
 {
   const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [{ text: 'Looks fine to me!' }] })
   const result = await h.invoke('')
   assert.equal(result.kind, 'error')
-  assert.ok(result.text.includes('no JSON object'))
+  assert.ok(result.text.includes('recorded no finding'), result.text)
+  assert.ok(result.text.includes('without calling finish_review'), result.text)
+  assert.ok(result.text.includes('Looks fine to me!'), 'and the reviewer’s own last message is shown as the diagnosis')
+  assert.equal(h.seen.prompts.length, 3, 'the model is asked to finish twice before the run gives up')
+}
+
+// 3b — recording nothing and finishing is a complete review, not a failure.
+{
+  const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'Nothing to report.')] })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  const payload = payloadOf(result.text)
+  assert.equal(payload.verdict, 'pass')
+  assert.deepEqual(payload.findings, [])
+  assert.equal(payload.incomplete, null, 'a finished review is not marked partial')
+  assert.ok(result.text.includes('Nothing to report.'), 'and the summary it recorded opens the report')
 }
 
 // 4 — a session with no recorded change is refused with a reason.
@@ -381,7 +589,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   assert.ok(result.text.includes('session record: none still served'), result.text)
 }
 
-// 5 — a change record the Host no longer serves is reported, not guessed.
+// 5 — a change record the Host does not serve is reported, not guessed.
 {
   const h = harness({ summary: undefined, diffs: [] })
   const result = await h.invoke('')
@@ -423,7 +631,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   })
 }
 
-// 9 — the route resolves from agent.options first, with the older top-level fields as a fallback.
+// 9 — the route resolves from agent.options first, with the top-level agent fields as a fallback.
 {
   const configured = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
   assert.deepEqual(
@@ -456,13 +664,18 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('fail', [{ ...PROVEN, evidence: '+if (board == nil) { return nil }' }], 'invented')],
+    script: [record([{ ...PROVEN, evidence: '+if (board == nil) { return nil }' }], 'invented')],
   })
   const result = await h.invoke('')
   const payload = payloadOf(result.text)
   assert.equal(payload.findings.length, 0, 'the unprovable finding is not published')
   assert.equal(payload.withheld.length, 1)
   assert.equal(payload.verdict, 'pass', 'a withheld claim cannot fail the review')
+  assert.deepEqual(
+    Object.keys(payload.withheld[0]).sort(),
+    ['file', 'line', 'reason', 'severity', 'title'],
+    'the withheld entry names the finding it is about, and why it was not published',
+  )
   assert.ok(payload.withheld[0].reason.includes('does not occur'), payload.withheld[0].reason)
   assert.ok(result.text.includes('Withheld as unprovable'), 'the report names the withheld claim')
 }
@@ -472,7 +685,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('warn', [{ ...PROVEN, file: 'internal/invisible/file.go' }])],
+    script: [record([{ ...PROVEN, file: 'internal/invisible/file.go' }])],
   })
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.findings.length, 0)
@@ -484,7 +697,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('warn', [{ ...PROVEN, evidence: '' }])],
+    script: [record([{ ...PROVEN, evidence: '' }])],
   })
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.findings.length, 0)
@@ -496,7 +709,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('fail', [PROVEN], 'Nil board.')],
+    script: [record([PROVEN], 'Nil board.')],
   })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success', 'the user still gets the report')
@@ -514,7 +727,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
     const h = harness({
       summary: SUMMARY,
       diffs: [TEXT_DIFF, BINARY_DIFF],
-      script: [answer('fail', [PROVEN], 'Nil board.')],
+      script: [record([PROVEN], 'Nil board.')],
     })
     await h.invoke('')
     assert.equal(h.seen.steer.length, 1, 'an opted-in steer delivers')
@@ -599,7 +812,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
     diffs: [TEXT_DIFF, BINARY_DIFF],
     script: [
       { toolCalls: [{ name: 'read_file', arguments: JSON.stringify({ path: READ_ONLY_FILE }) }] },
-      answer('major', [{
+      record([{
         severity: 'major', category: 'correctness', file: READ_ONLY_FILE, line: 4,
         title: 'Reset leaves the board unplayable', problem: 'the caller resets a board it just built',
         impact: 'Every game started through this path begins from an empty position.',
@@ -611,13 +824,19 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   const result = await h.invoke('')
   assert.equal(result.kind, 'success')
   assert.ok(Array.isArray(h.seen.prompts[0].tools), 'tools are offered on the first call')
-  assert.deepEqual(h.seen.prompts[0].tools.map(tool => tool.name), ['read_file', 'list_dir', 'search'])
+  assert.deepEqual(
+    h.seen.prompts[0].tools.map(tool => tool.name),
+    [...REVIEW_TOOL_NAMES, ...READER_TOOL_NAMES],
+    'the six review tools come first, so a tool-less answer is never the only option',
+  )
   const toolMessages = messagesOf(h.seen.prompts[1], 'tool')
-  assert.equal(toolMessages.length, 1, 'the tool result went back to the model')
+  assert.equal(toolMessages.length, 1, 'the read result went back to the model')
   assert.ok(toolMessages[0].content[0].text.includes('MARKER_NIL_SQUARES'), 'the file content reached the model')
   assert.ok(toolMessages[0].content[0].text.includes('[reader budget: 1/30 calls'), 'the model is told its remaining budget')
   const callBlocks = messagesOf(h.seen.prompts[1], 'assistant')[0].content
+  assert.equal(callBlocks.length, 1, 'the first turn asked for one read')
   assert.equal(callBlocks[0].type, 'tool-call')
+  assert.equal(callBlocks[0].name, 'read_file')
   const payload = payloadOf(result.text)
   assert.equal(payload.findings.length, 1, 'a finding verified by reading is published')
   assert.equal(payload.findings[0].file, READ_ONLY_FILE)
@@ -633,7 +852,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
     diffs: [TEXT_DIFF, BINARY_DIFF],
     script: [
       { toolCalls: [{ name: 'search', arguments: JSON.stringify({ query: 'MARKER_NIL_SQUARES' }) }] },
-      answer('minor', [{
+      record([{
         severity: 'minor', category: 'consistency', file: READ_ONLY_FILE, line: 4,
         title: 'Marker', problem: 'found by search',
         impact: 'The marker survives a reset that should have cleared it.',
@@ -654,7 +873,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
     diffs: [TEXT_DIFF, BINARY_DIFF],
     script: [
       { toolCalls: [{ name: 'read_file', arguments: JSON.stringify({ path: '../../outside.txt' }) }] },
-      answer('fail', [{ ...PROVEN, file: '../../outside.txt', evidence: 'OUTSIDE_SECRET' }]),
+      record([{ ...PROVEN, file: '../../outside.txt', evidence: 'OUTSIDE_SECRET' }]),
     ],
   })
   const result = await h.invoke('')
@@ -666,84 +885,188 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   assert.equal(payload.withheld.length, 1)
 }
 
-// 20 — an unknown tool name is refused, never executed.
+// 20 — an unknown tool name is refused, never executed, and the refusal names what this run does offer — a name one letter from a reader tool included.
 {
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
     script: [
-      { toolCalls: [{ name: 'run_command', arguments: '{"cmd":"rm -rf /"}' }] },
-      answer('pass', []),
+      {
+        toolCalls: [
+          { name: 'run_command', arguments: '{"cmd":"rm -rf /"}' },
+          toolCall('read_files', { path: READ_ONLY_FILE }),
+        ],
+      },
+      record([]),
     ],
   })
   const result = await h.invoke('')
-  const refusal = messagesOf(h.seen.prompts[1], 'tool')[0]
-  assert.equal(refusal.isError, true)
-  assert.ok(refusal.content[0].text.includes('unknown tool'), refusal.content[0].text)
+  const refusals = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(refusals.length, 2, 'every call of the turn got exactly one result')
+  assert.equal(refusals[0].isError, true)
+  assert.ok(refusals[0].content[0].text.includes('unknown tool "run_command"'), refusals[0].content[0].text)
+  assert.ok(refusals[0].content[0].text.includes('append_finding'), 'the review tools are named as available')
+  assert.ok(refusals[0].content[0].text.includes('search'), 'and so are the reader tools')
+  assert.ok(refusals[1].content[0].text.includes('unknown tool "read_files"'), refusals[1].content[0].text)
+  assert.equal(payloadOf(result.text).stats.context.calls, 0, 'a near-miss name is never run as the tool it resembles')
   assert.equal(result.kind, 'success')
 }
 
-// 21 — the tool-call budget is enforced, the tools are then withdrawn, and the answer still lands.
+// 21 — the reader budget is enforced, the reader tools are then withdrawn, and the review tools are not.
 {
   await withSettings({ maxToolCalls: 2 }, async () => {
     const h = harness({
       summary: SUMMARY,
       diffs: [TEXT_DIFF, BINARY_DIFF],
       script: [
-        { toolCalls: [{ name: 'list_dir', arguments: '{"path":"internal"}' }] },
-        { toolCalls: [{ name: 'list_dir', arguments: '{"path":"internal/play"}' }] },
-        answer('pass', [], 'looked around'),
+        { toolCalls: [toolCall('list_dir', { path: 'internal' })] },
+        { toolCalls: [toolCall('list_dir', { path: 'internal/play' })] },
+        {
+          toolCalls: [
+            toolCall('read_file', { path: READ_ONLY_FILE }),
+            toolCall('append_finding', PROVEN),
+            toolCall('set_summary', { summary: 'looked around' }),
+          ],
+        },
+        { toolCalls: [toolCall('finish_review', {})] },
       ],
     })
     const result = await h.invoke('')
     assert.equal(result.kind, 'success')
-    assert.equal(h.seen.prompts.length, 3, 'two reading calls and one final answer')
-    assert.ok(Array.isArray(h.seen.prompts[0].tools) && Array.isArray(h.seen.prompts[1].tools))
-    assert.equal(h.seen.prompts[2].tools, undefined, 'tools are withdrawn once the budget is spent')
-    assert.equal(messagesOf(h.seen.prompts[2], 'tool').length, 2)
+    assert.equal(h.seen.prompts.length, 4, 'two reading calls, one recording turn and the finish')
+    assert.deepEqual(
+      h.seen.prompts[2].tools.map(tool => tool.name),
+      REVIEW_TOOL_NAMES,
+      'the reader tools are gone once the budget is spent; the review tools stay',
+    )
     const note = messagesOf(h.seen.prompts[2], 'user').at(-1).content[0].text
-    assert.ok(note.includes('reader budget spent'), 'the model is told to answer now')
-    assert.equal(payloadOf(result.text).stats.context.calls, 2)
+    assert.ok(note.includes('the reader budget is spent'), 'the model is told the reading is over')
+    assert.ok(!note.includes('no further tool calls'), 'but never told to stop using the review tools')
+    const tool = messagesOf(h.seen.prompts[3], 'tool')
+    assert.equal(tool.length, 5, 'every call of the turn got exactly one result')
+    assert.equal(tool[2].isError, true, 'a further read is refused')
+    assert.ok(tool[2].content[0].text.includes('reader budget is spent'), tool[2].content[0].text)
+    assert.equal(tool[3].isError, undefined, 'and the finding is recorded anyway')
+    assert.ok(tool[3].content[0].text.includes('f1 [blocker]'), tool[3].content[0].text)
+    assert.ok(tool[4].content[0].text.includes('summary recorded'), tool[4].content[0].text)
+    const payload = payloadOf(result.text)
+    assert.equal(payload.stats.context.calls, 2, 'a refused read is not counted as a read')
+    assert.equal(payload.findings.length, 1, 'the finding recorded after the budget landed')
   })
 }
 
-// 22 — project access can be turned off entirely.
+// 22 — project access can be turned off entirely, and the review tools remain.
 {
   await withSettings({ projectAccess: false }, async () => {
-    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
-    await h.invoke('')
-    assert.equal(h.seen.prompts.length, 1)
-    assert.equal(h.seen.prompts[0].tools, undefined, 'no tools are offered')
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      script: [
+        {
+          toolCalls: [
+            toolCall('read_file', { path: READ_ONLY_FILE }),
+            toolCall('list_dir', { path: 'internal' }),
+            toolCall('append_finding', PROVEN),
+          ],
+        },
+        { toolCalls: [toolCall('set_summary', { summary: 'diff only' }), toolCall('finish_review', {})] },
+      ],
+    })
+    const result = await h.invoke('')
+    assert.deepEqual(h.seen.prompts[0].tools.map(tool => tool.name), REVIEW_TOOL_NAMES, 'only the review tools are offered')
+    assert.equal(assertOneReading(h.seen.prompts[0], 'project access off'), false, 'and the contract says so, not the persona')
+    assert.ok(h.seen.prompts[0].system.includes('This run cannot read the project'), 'the reviewer is told what this run can do')
+    const refused = messagesOf(h.seen.prompts[1], 'tool')
+    assert.equal(refused.length, 3, 'every call of the turn got exactly one result')
+    assert.equal(refused[0].isError, true, 'a read is refused when project access is off')
+    // The run's own gate is the reason, not the harness: the harness does expose
+    // `read` here, and saying otherwise would send the user to the wrong setting.
+    assert.ok(
+      refused[0].content[0].text.includes('read_file is not available in this run (project access is off for this run)'),
+      refused[0].content[0].text,
+    )
+    assert.ok(refused[0].content[0].text.includes('append_finding'), 'and the refusal names the tools that are available')
+    // list_dir is the plugin's own, so it reaches the run's own gate, which is the reason every reader tool refused here should carry.
+    assert.equal(refused[1].isError, true, 'a listing is refused too')
+    assert.ok(
+      refused[1].content[0].text.includes('list_dir is not available in this run (project access is off for this run)'),
+      refused[1].content[0].text,
+    )
+    assert.equal(refused[2].isError, undefined, 'and the finding is recorded anyway')
+    assert.equal(h.tools.calls.length, 0, 'a run that cannot read consults no harness tool for one')
+    const payload = payloadOf(result.text)
+    assert.equal(payload.findings.length, 1, 'a finding recorded from the diff alone is still published')
   })
 }
 
-// 23 — a route that cannot take tools is retried diff-only, not abandoned.
+// 23 — one failed call is retried with a smaller output cap and no project access, but never without the review tools.
 {
-  const h = harness({
-    summary: SUMMARY,
-    diffs: [TEXT_DIFF, BINARY_DIFF],
-    failFirstWithTools: true,
-    script: [answer('warn', [PROVEN], 'diff only')],
+  await withSettings({ projectAccess: true }, async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      failAtCall: 1,
+      script: [record([PROVEN], 'diff only')],
+    })
+    const result = await h.invoke('')
+    assert.equal(result.kind, 'success', 'the review still completes')
+    assert.equal(h.seen.prompts.length, 2, 'the failed call and the retry')
+    assert.deepEqual(h.seen.prompts[1].tools.map(tool => tool.name), REVIEW_TOOL_NAMES, 'the retry keeps the review tools and drops the reader')
+    assert.equal(assertOneReading(h.seen.prompts[1], 'the degraded retry'), false, 'and is told it cannot read')
+    assert.equal(payloadOf(result.text).findings.length, 1, 'a diff-grounded finding still publishes')
+    assert.equal(payloadOf(result.text).stats.context.calls, 0, 'no reader call was made')
+    assert.equal(h.seen.prompts[0].maxTokens, 50000, 'the configured output cap is attempted first')
+    assert.equal(h.seen.prompts[1].maxTokens, 8192, 'the retry shrinks the output cap')
+    assert.equal(payloadOf(result.text).stats.reviewerFallback, true, 'the report admits the review ran degraded')
+    assert.ok(result.text.includes('degraded retry (diff only, smaller output cap)'), 'and says what was degraded')
   })
-  const result = await h.invoke('')
-  assert.equal(result.kind, 'success', 'the review still completes')
-  assert.equal(h.seen.prompts.length, 2, 'the failed call and the retry')
-  assert.ok(Array.isArray(h.seen.prompts[0].tools), 'the first attempt offered tools')
-  assert.equal(h.seen.prompts[1].tools, undefined, 'the retry runs without tools')
-  assert.equal(payloadOf(result.text).findings.length, 1, 'a diff-grounded finding still publishes')
-  assert.equal(payloadOf(result.text).stats.context.calls, 0, 'no reader call was made')
-  assert.equal(h.seen.prompts[0].maxTokens, 50000, 'the configured output cap is attempted first')
-  assert.equal(h.seen.prompts[1].maxTokens, 8192, 'the retry shrinks the output cap')
-  assert.equal(payloadOf(result.text).stats.reviewerFallback, true, 'the report admits the review ran degraded')
 }
 
-// 24 — reading stops at the configured fraction of the timeout, not at the hard kill.
+// 24 — reading stops at the configured fraction of the timeout, not at the hard kill, and the contract does not claim the tools either.
 {
   await withSettings({ timeoutMs: 1000, toolDeadlineRatio: 0.0000001 }, async () => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
     const result = await h.invoke('')
-    assert.equal(h.seen.prompts[0].tools, undefined, 'no tools are offered once the reading deadline has passed')
+    assert.deepEqual(h.seen.prompts[0].tools.map(tool => tool.name), REVIEW_TOOL_NAMES, 'no reader tool is offered once the reading deadline has passed')
+    assert.equal(assertOneReading(h.seen.prompts[0], 'the reading deadline has passed'), false, 'nor promised by the contract, which the setting alone would have promised')
     assert.equal(result.kind, 'success', 'the report is still produced')
+  })
+}
+
+// 24b — the byte budget withdraws the reader tools exactly as the call budget and the clock do, and no offer still promises a tool it would refuse.
+{
+  await withSettings({ maxReadBytes: 1 }, async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      script: [
+        { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] },
+        { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE }), toolCall('run_command', { command: 'ls' })] },
+        { toolCalls: [toolCall('append_finding', PROVEN), toolCall('finish_review', {})] },
+      ],
+    })
+    const result = await h.invoke('')
+    assert.equal(result.kind, 'success', result.text)
+    assert.deepEqual(
+      h.seen.prompts[0].tools.map(tool => tool.name),
+      [...REVIEW_TOOL_NAMES, ...READER_TOOL_NAMES],
+      'the reader tools are offered while any budget is left',
+    )
+    assert.deepEqual(
+      h.seen.prompts[1].tools.map(tool => tool.name),
+      REVIEW_TOOL_NAMES,
+      'the byte budget withdraws them, exactly as the call budget does',
+    )
+    const turn = messagesOf(h.seen.prompts[2], 'tool').slice(1)
+    assert.equal(turn.length, 2, 'the second turn asked for two calls')
+    assert.equal(turn[0].isError, true, 'a read past the byte budget is refused')
+    assert.ok(turn[0].content[0].text.includes('the reader byte budget is spent'), turn[0].content[0].text)
+    assert.ok(!turn[0].content[0].text.includes('read_file'), 'and the refusal promises no reader tool')
+    assert.equal(turn[1].isError, true)
+    assert.ok(turn[1].content[0].text.includes('unknown tool'), turn[1].content[0].text)
+    assert.ok(turn[1].content[0].text.includes('append_finding'), 'the offer list names the review tools')
+    assert.ok(!turn[1].content[0].text.includes('read_file'), 'and none of the reader tools the run has stopped offering')
+    assert.equal(payloadOf(result.text).findings.length, 1, 'the review is recorded either way')
   })
 }
 
@@ -763,7 +1086,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [...reads, answer('pass', [], 'read a lot')],
+    script: [...reads, record([], 'read a lot')],
   })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success')
@@ -791,7 +1114,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('major', [{ ...PROVEN, trigger: '' }])],
+    script: [record([{ ...PROVEN, trigger: '' }])],
   })
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.findings.length, 0)
@@ -804,7 +1127,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('major', [{ ...PROVEN, impact: '' }])],
+    script: [record([{ ...PROVEN, impact: '' }])],
   })
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.findings.length, 0)
@@ -815,7 +1138,7 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
 // 28 — impact and trigger reach the payload, the report and the opt-in notice.
 {
   await withSettings({ notifyAgent: 'steer' }, async () => {
-    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('fail', [PROVEN])] })
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([PROVEN])] })
     const result = await h.invoke('')
     const payload = payloadOf(result.text)
     assert.equal(payload.findings[0].impact, PROVEN.impact)
@@ -840,13 +1163,13 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   })
 }
 
-// 30 — when the newest record is no longer served, an older one is reviewed instead, and said so.
+// 30 — when the newest record is not among those served, an earlier one is reviewed instead, and the report says so.
 {
   const h = harness({
     summaries: { 5: SUMMARY },
     events: [5, 9],
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('pass', [], 'older turn')],
+    script: [record([], 'older turn')],
   })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success', 'the review falls back to a served record')
@@ -856,7 +1179,6 @@ const answer = (verdict, findings, summary = 'x') => ({ text: JSON.stringify({ v
   assert.ok(result.text.includes('have no comparison in this Host process'), 'the report says so')
 }
 
-/** A real repository with one committed file, one local edit and one new file. */
 function gitFixture() {
   const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-repo-'))
   const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
@@ -884,7 +1206,7 @@ const GIT_FINDING = {
     cwd: repo,
     hasEvent: false,
     diffs: [],
-    script: [answer('major', [GIT_FINDING], 'Reset is broken.')],
+    script: [record([GIT_FINDING], 'Reset is broken.')],
   })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success', result.text)
@@ -911,14 +1233,12 @@ const GIT_FINDING = {
     cwd: repo,
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('pass', [], 'session fallback')],
+    script: [record([], 'session fallback')],
   })
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.source, 'session', 'a clean tree falls back to the recorded changes')
   assert.equal(payload.stats.reviewed, 1)
-  // The record this source reads is this session's own work, so the prompt must
-  // present it as primary. Labelling it "not by this session" would point the
-  // reviewer at the rest of the workspace instead of at the change set.
+  // This record is this session's own work, so the prompt must present it as primary; 'not by this session' would point the reviewer at the rest of the workspace.
   const prompt = h.seen.prompts[0].messages[0].content[0].text
   assert.ok(
     prompt.includes('primary — written or edited in this session: internal/chessx/board.go'),
@@ -944,7 +1264,7 @@ const GIT_FINDING = {
       cwd: repo,
       hasEvent: false,
       diffs: [],
-      script: [answer('major', [GIT_FINDING], 'committed work')],
+      script: [record([GIT_FINDING], 'committed work')],
     })
     const result = await h.invoke('')
     assert.equal(result.kind, 'success', result.text)
@@ -986,7 +1306,7 @@ const GIT_FINDING = {
             { name: 'read_file', arguments: JSON.stringify({ path: READ_ONLY_FILE }) },
           ],
         },
-        answer('pass', [], 'done'),
+        record([], 'done'),
       ],
     })
     const result = await h.invoke('')
@@ -1012,7 +1332,7 @@ const GIT_FINDING = {
       { role: 'assistant', content: [{ type: 'text', text: 'tamam' }] },
       { role: 'user', source: { kind: 'code-review', form: 'notice' }, content: [{ type: 'text', text: '[code-review] previous report body' }] },
     ],
-    script: [answer('pass', [], 'x')],
+    script: [record([], 'x')],
   })
   await h.invoke('')
   const prompt = h.seen.prompts[0].messages[0].content[0].text
@@ -1020,17 +1340,12 @@ const GIT_FINDING = {
   assert.ok(!prompt.includes('previous report body'), 'the notice never leaks in')
 }
 
-/** The React stand-in for helper tests: it never draws, so no component runs. */
 const STUB_REACT = {
   createElement: () => null,
   useMemo: () => undefined,
   useState: () => [true, () => {}],
 }
 
-/**
- * A React stand-in that records the element tree instead of drawing it, so what
- * the card would show can be inspected without a browser.
- */
 function recordingReact() {
   const h = (type, props, ...children) => ({
     type,
@@ -1046,11 +1361,6 @@ function recordingReact() {
   }
 }
 
-/**
- * Load the Client artifact the way the page does and return its module
- * descriptor, so a test can build it with whichever React stand-in it needs.
- * The module is imported once — a page also evaluates it once.
- */
 let clientModule
 async function loadClientModule() {
   if (clientModule !== undefined) return clientModule
@@ -1069,27 +1379,33 @@ async function loadClientModule() {
   return clientModule
 }
 
-/**
- * Mount the card for one command outcome and collect what it would show: the
- * visible strings and the caption of every button it draws.
- */
-async function renderCard(outcome) {
+/** Apply the client half once with recording stubs, capturing every seat the artifact registers. */
+async function loadClientSurface() {
   const api = (await loadClientModule()).factory(() => recordingReact())
-  let Card
+  const registrations = []
   api.apply({
     effect: callback => callback(),
     locale: { register: () => () => {}, bind: () => key => key },
     slots: {
       inject: (_slot, callback) => callback(),
-      register: (_options, component) => { Card = component; return () => {} },
+      register: (options, component) => { registrations.push({ options, component }); return () => {} },
     },
   })
-  assert.equal(typeof Card, 'function', 'the card is registered on the command view')
+  return { api, registrations }
+}
 
+/** The single component the artifact seats in one named slot. */
+function componentOn(registrations, name) {
+  const seated = registrations.filter(entry => entry.options.name === name)
+  assert.equal(seated.length, 1, `the client half seats exactly one component on ${name}`)
+  return seated[0].component
+}
+
+/** Render one client component and collect the short strings and button captions it draws. */
+function drawComponent(component, props) {
   const seen = { texts: [], buttons: [] }
   const visit = node => {
     if (typeof node === 'string') {
-      // The stylesheet is one long child; it is not something the card shows.
       if (node.length < 80 && !node.includes('{')) seen.texts.push(node)
       return
     }
@@ -1102,11 +1418,30 @@ async function renderCard(outcome) {
     }
     visit(node.props.children)
   }
-  visit(Card({ node: { outcome }, t: key => key }))
+  visit(component(props))
   return seen
 }
 
-/** Load the module API with the inert React above, for its pure helpers. */
+async function renderCard(outcome) {
+  const { registrations } = await loadClientSurface()
+  return drawComponent(componentOn(registrations, 'conversation.chat.commandview'), {
+    node: { outcome },
+    t: key => key,
+  })
+}
+
+/** Mount the composer-dock seat with the folded command stream and Session lifecycle its owner supplies. */
+async function renderDock({ nodes, session, activeTargets = 0 }) {
+  const { registrations } = await loadClientSurface()
+  return drawComponent(componentOn(registrations, 'conversation.input.dock'), {
+    session,
+    input: {},
+    useChat: selector => selector({ legacy: { nodes } }),
+    useConversation: selector => selector({ activeTargets: { size: activeTargets } }),
+    t: key => key,
+  })
+}
+
 let clientApi
 async function loadClientApi() {
   if (clientApi !== undefined) return clientApi
@@ -1139,7 +1474,7 @@ async function loadClientApi() {
       diffs: [TEXT_DIFF, BINARY_DIFF],
       script: [
         { toolCalls: [{ name: 'search', arguments: JSON.stringify({ query: 'NEEDLE_ROW_', maxResults: 60 }) }] },
-        answer('pass', [], 'searched'),
+        record([], 'searched'),
       ],
     })
     const result = await h.invoke('')
@@ -1167,7 +1502,7 @@ async function loadClientApi() {
       diffs: [TEXT_DIFF, BINARY_DIFF],
       script: [
         { toolCalls: [{ name: 'read_file', arguments: JSON.stringify({ path: 'link-out/secret.txt' }) }] },
-        answer('pass', [], 'x'),
+        record([], 'x'),
       ],
     })
     await h.invoke('')
@@ -1185,7 +1520,7 @@ async function loadClientApi() {
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('fail', [{ ...PROVEN, evidence: `+${'x'.repeat(400)}` }])],
+    script: [record([{ ...PROVEN, evidence: `+${'x'.repeat(400)}` }])],
   })
   const payload = payloadOf((await h.invoke('')).text)
   assert.equal(payload.findings.length, 0)
@@ -1203,7 +1538,7 @@ async function loadClientApi() {
     hasEvent: false,
     diffs: [],
     toolCalls: [{ name: 'write', arguments: { file_path: join(root, 'fresh.go') } }],
-    script: [answer('pass', [], 'session only')],
+    script: [record([], 'session only')],
   })
   const result = await h.invoke('session')
   assert.equal(result.kind, 'success', result.text)
@@ -1226,7 +1561,7 @@ async function loadClientApi() {
     hasEvent: false,
     diffs: [],
     toolCalls: [{ name: 'read', arguments: { file_path: join(root, 'board.go') } }],
-    script: [answer('pass', [], 'x')],
+    script: [record([], 'x')],
   })
   const result = await h.invoke('session')
   assert.equal(result.kind, 'error')
@@ -1243,7 +1578,7 @@ async function loadClientApi() {
     hasEvent: false,
     diffs: [],
     toolCalls: [{ name: 'edit', arguments: { file_path: join(root, 'board.go') } }],
-    script: [answer('pass', [], 'x')],
+    script: [record([], 'x')],
   })
   await h.invoke('full')
   const prompt = h.seen.prompts[0].messages[0].content[0].text
@@ -1286,10 +1621,6 @@ async function loadClientApi() {
   })
 }
 
-/**
- * A repository whose session works in `sub/`, with unrelated changes elsewhere.
- * The session directory is deliberately not the repository root.
- */
 function subdirectoryFixture() {
   const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-subrepo-'))
   const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
@@ -1318,7 +1649,7 @@ function subdirectoryFixture() {
       { name: 'write', arguments: { file_path: join(root, 'sub', 'a.go') } },
       { name: 'edit', arguments: { file_path: join(root, 'sub', 'c.go') } },
     ],
-    script: [answer('pass', [], 'subdirectory session')],
+    script: [record([], 'subdirectory session')],
   })
   const result = await h.invoke('session')
   assert.equal(result.kind, 'success', result.text)
@@ -1338,7 +1669,7 @@ function subdirectoryFixture() {
     hasEvent: false,
     diffs: [],
     toolCalls: [{ name: 'write', arguments: { file_path: join(root, 'sub', 'a.go') } }],
-    script: [answer('pass', [], 'x')],
+    script: [record([], 'x')],
   })
   await h.invoke('full')
   const prompt = h.seen.prompts[0].messages[0].content[0].text
@@ -1363,7 +1694,7 @@ function subdirectoryFixture() {
       hasEvent: false,
       diffs: [],
       toolCalls: [{ name: 'write', arguments: { file_path: join(link, 'a.go') } }],
-      script: [answer('pass', [], 'via a link')],
+      script: [record([], 'via a link')],
     })
     const result = await h.invoke('session')
     assert.equal(result.kind, 'success', result.text)
@@ -1379,12 +1710,10 @@ function subdirectoryFixture() {
   const api = await loadClientApi()
   assert.deepEqual(
     Object.keys(api.__test).sort(),
-    ['findingText', 'modeOf', 'parsePayload', 'readOutcome', 'reportOf', 'severityOf'],
-    'the Client half exposes copy helpers and the mode reader only — there is no send path to misuse',
+    ['findingText', 'modeOf', 'parsePayload', 'readOutcome', 'reportOf', 'severityOf', 'transcriptHidden'],
+    'the Client half exposes copy helpers, the mode reader and the transcript gate only — there is no send path to misuse',
   )
 
-  // The face decides what the card claims. A command that succeeded but whose
-  // payload did not parse must not be reported as a review that never ran.
   assert.equal(api.__test.readOutcome(null).face, 'running')
   assert.equal(api.__test.readOutcome({ kind: 'error', text: 'boom' }).face, 'error')
   assert.equal(
@@ -1412,9 +1741,6 @@ function subdirectoryFixture() {
     'a finding that names no file stays clean',
   )
 
-  // The copy follows the mode the payload describes: an arc finding pastes the
-  // way the arc card drew it, and a field that mode does not declare is not
-  // copied at all.
   const arcMode = api.__test.modeOf({
     mode: {
       id: 'arc',
@@ -1444,7 +1770,7 @@ function subdirectoryFixture() {
     cwd: repo,
     hasEvent: false,
     diffs: [],
-    script: [answer('fail', [GIT_FINDING], 'Reset panics instead of resetting.')],
+    script: [record([GIT_FINDING], 'Reset panics instead of resetting.')],
   })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success', result.text)
@@ -1454,8 +1780,6 @@ function subdirectoryFixture() {
   assert.ok(result.text.includes('Reset panics instead of resetting'), 'with the finding in it')
   assert.ok(result.text.includes('**Evidence:**'), 'and the evidence behind it')
 
-  // The Client half reads exactly what the Host half wrote: the two halves meet
-  // on the payload marker, and the copy takes the report without it.
   const api = await loadClientApi()
   const payload = api.__test.parsePayload(result.text)
   assert.equal(payload?.findings?.length, 1, 'the card parses the host report')
@@ -1471,31 +1795,26 @@ function subdirectoryFixture() {
   const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-numstat-'))
   const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
   git(['init', '-q'])
-  // Every line below is chosen so that its diff line collides with a file header
-  // or a hunk marker: a deleted `-- x` renders as `--- x`, an added `++ x` renders
-  // as `+++ x`, an added `+++ x` as `++++ x`.
+  // Each line collides with a file header or a hunk marker: a deleted '-- x' renders as '--- x', an added '++ x' as '+++ x'.
   writeFileSync(join(repo, 'tricky.txt'), ['alpha', '-- old sql comment', '--- old rule', '++ old increment', 'omega', ''].join('\n'))
   writeFileSync(join(repo, 'tail.txt'), 'first\nsecond\n')
   git(['add', '.'])
   git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
   writeFileSync(join(repo, 'tricky.txt'), ['alpha', '-- new sql comment', '--- new rule', '++ new increment', '+++ new triple', 'omega', ''].join('\n'))
-  // No trailing newline: git appends a `\ No newline at end of file` marker that
-  // must not be counted as either side.
+  // No trailing newline: the '\ No newline at end of file' marker git appends must not be counted as either side.
   writeFileSync(join(repo, 'tail.txt'), 'first\nchanged')
 
   const totals = git(['diff', '--numstat']).stdout.trim().split('\n')
     .map(line => line.split('\t'))
     .filter(cols => /^\d+$/.test(cols[0]) && /^\d+$/.test(cols[1]))
     .reduce((sum, cols) => ({ added: sum.added + Number(cols[0]), deleted: sum.deleted + Number(cols[1]) }), { added: 0, deleted: 0 })
-  // A guard that the fixture is a real change; the assertions that matter are the
-  // agreement with git below and the ambiguous lines the diff is checked for.
   assert.ok(totals.added > 0 && totals.deleted > 0, `the fixture changes lines: ${JSON.stringify(totals)}`)
 
   const h = harness({
     cwd: repo,
     hasEvent: false,
     diffs: [],
-    script: [answer('pass', [], 'tallied')],
+    script: [record([], 'tallied')],
   })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success', result.text)
@@ -1543,8 +1862,6 @@ function subdirectoryFixture() {
     ['action.copyReport', 'toggle.hide', 'action.copyFinding'],
     'the card draws the two copy actions and the collapse toggle, in that order',
   )
-  // The guarantee this test exists for: no control on the card can reach the
-  // agent. A button that is neither a copy action nor the toggle fails here.
   const ALLOWED = new Set(['action.copyReport', 'action.copyFinding', 'toggle.hide', 'toggle.show'])
   assert.deepEqual(
     full.buttons.filter(caption => !ALLOWED.has(caption)),
@@ -1552,8 +1869,6 @@ function subdirectoryFixture() {
     'nothing on the card does anything but copy or collapse',
   )
   assert.ok(full.texts.includes('a.go:3'), 'the finding names its location')
-  // A payload without a `mode` block is drawn with the vocabulary the plugin
-  // shipped before modes: the fallback is what keeps an old card readable.
   assert.ok(full.texts.includes('Impact: i'), 'and carries its impact')
   assert.ok(full.texts.includes('How it is reached: tr'), 'and how it is reached')
   assert.ok(full.texts.includes('Evidence'), 'and the evidence behind it')
@@ -1580,7 +1895,7 @@ function subdirectoryFixture() {
     git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
     writeFileSync(join(repo, name), 'package spaced\n\nvar A = 2\n')
 
-    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'spaced')] })
+    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'spaced')] })
     const result = await h.invoke('')
     assert.equal(result.kind, 'success', result.text)
     const payload = payloadOf(result.text)
@@ -1606,13 +1921,13 @@ function subdirectoryFixture() {
   writeFileSync(join(repo, 'logo.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe, 0xfd]))
   writeFileSync(join(repo, 'plain.go'), 'package plain\n\nvar B = 2\n')
 
-  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'binary')] })
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'binary')] })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success', result.text)
   const payload = payloadOf(result.text)
   assert.equal(payload.stats.reviewed, 1, 'only the text file was reviewed')
   assert.deepEqual(payload.stats.skipped, [{ file: 'logo.png', reason: 'binary' }], 'the binary is listed as left out')
-  assert.ok(result.text.includes('- logo.png — binary'), 'and the report says so where the README promises it')
+  assert.ok(result.text.includes('- logo.png — binary'), 'and the report says why it was left out')
   const prompt = h.seen.prompts[0].messages[0].content[0].text
   assert.ok(!prompt.includes('Binary files'), 'no hunk-less stub was sent to the reviewer')
   assert.ok(prompt.includes('+var B = 2'), 'while the text change still was')
@@ -1630,14 +1945,13 @@ function subdirectoryFixture() {
   writeFileSync(join(repo, 'a1.go'), 'package a\n\nvar ONE = 2\n')
   writeFileSync(join(repo, 'a[1].go'), 'package a\n\nvar TWO = 2\n')
 
-  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'glob')] })
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'glob')] })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success', result.text)
   assert.equal(payloadOf(result.text).stats.reviewed, 2, 'both files are reviewed')
   const prompt = h.seen.prompts[0].messages[0].content[0].text
   const occurrences = needle => prompt.split(needle).length - 1
-  // Read as a glob, `a[1].go` also matches `a1.go`, so one file's change would
-  // be pulled into the other's diff and reported twice.
+  // Read as a glob, 'a[1].go' also matches 'a1.go', so one file's change would be pulled into the other's diff and reported twice.
   assert.equal(occurrences('+var ONE = 2'), 1, 'each file is diffed once')
   assert.equal(occurrences('+var TWO = 2'), 1, 'and the pattern-like name pulled in no other file')
 }
@@ -1650,11 +1964,10 @@ function subdirectoryFixture() {
   writeFileSync(join(repo, 'a.go'), 'package a\n\nvar A = 1\n')
   git(['add', '.'])
   git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
-  // The added line is whitespace only and it is the last line, so trimming the
-  // whole diff would silently rewrite it into a bare '+'.
+  // The added line is whitespace only and last, so trimming the whole diff would rewrite it into a bare '+'.
   writeFileSync(join(repo, 'a.go'), 'package a\n\nvar A = 1\n   \n')
 
-  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'verbatim')] })
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'verbatim')] })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success', result.text)
   const prompt = h.seen.prompts[0].messages[0].content[0].text
@@ -1662,12 +1975,6 @@ function subdirectoryFixture() {
   assert.ok(!prompt.includes('\n+\n'), 'and was not rewritten into a bare +')
 }
 
-/**
- * A repository with no ignore file of its own: a changed source file next to the
- * junk every project produces. `vendor/lib/vendored.go` is tracked — committed
- * by force, the mistake that makes `node_modules` show up in a diff — while the
- * dependency tree, the bundle and the log are untracked.
- */
 function noisyFixture() {
   const repo = mkdtempSync(join(tmpdir(), 'dsh-code-review-noisy-'))
   const git = args => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
@@ -1688,13 +1995,12 @@ function noisyFixture() {
   return { repo, git }
 }
 
-/** The change-set junk a noisyFixture review must never have looked at. */
 const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VENDOR_NEEDLE']
 
 // 57 — the built-in list keeps dependencies, build output and logs out of the diff.
 {
   const { repo } = noisyFixture()
-  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'source only')] })
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'source only')] })
   const result = await h.invoke('')
   assert.equal(result.kind, 'success', result.text)
   const payload = payloadOf(result.text)
@@ -1737,7 +2043,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   writeFileSync(join(repo, 'generated', 'code.go'), 'package generated\n\nvar GEN_NEEDLE = 1\n')
 
   await withSettings({ ignored: ['generated/', '*.log'] }, async () => {
-    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'configured')] })
+    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'configured')] })
     const payload = payloadOf((await h.invoke('')).text)
     assert.equal(payload.stats.ignore.configured, 2, 'the config patterns are in force')
     assert.ok(
@@ -1747,12 +2053,9 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(!h.seen.prompts[0].messages[0].content[0].text.includes('GEN_NEEDLE'), 'and keeps the path out')
   })
 
-  // Typed on the command line: one pattern adds, one negation takes a built-in
-  // default back, one quoted pattern holds a space, and the rest of the line is
-  // still the focus message.
   mkdirSync(join(repo, 'odd dir'), { recursive: true })
   writeFileSync(join(repo, 'odd dir', 'note.md'), 'ODD_NEEDLE\n')
-  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'typed')] })
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'typed')] })
   const result = await h.invoke('ignored=!dist/,generated/ ignored="odd dir/" kalan odak')
   const payload = payloadOf(result.text)
   assert.equal(payload.focus, 'kalan odak', 'the focus message survives the ignore arguments')
@@ -1780,7 +2083,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   writeFileSync(join(repo, 'app.go'), 'package app\n\nvar A = 2\n')
   writeFileSync(join(repo, 'generated', 'api.go'), 'package generated\n\nvar REPO_NEEDLE = 2\n')
 
-  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'own rules')] })
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'own rules')] })
   const result = await h.invoke('')
   const payload = payloadOf(result.text)
   assert.equal(payload.stats.reviewed, 1, 'the tracked file the project itself ignores is out')
@@ -1792,8 +2095,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   )
   assert.ok(!h.seen.prompts[0].messages[0].content[0].text.includes('REPO_NEEDLE'))
 
-  // A negation wins over the repository's own rules too: the user is the last word.
-  const over = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'rescued')] })
+  const over = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'rescued')] })
   await over.invoke('ignored=!generated/api.go')
   assert.ok(
     over.seen.prompts[0].messages[0].content[0].text.includes('REPO_NEEDLE'),
@@ -1801,7 +2103,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   )
 
   await withSettings({ respectGitIgnore: false }, async () => {
-    const off = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'no repo rules')] })
+    const off = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'no repo rules')] })
     const offPayload = payloadOf((await off.invoke('')).text)
     assert.equal(offPayload.stats.ignore.gitIgnore, false, 'the repository rules can be turned off')
     assert.equal(offPayload.stats.reviewed, 2, 'and then the tracked file is reviewed again')
@@ -1812,7 +2114,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
 {
   const { repo } = noisyFixture()
   await withSettings({ ignoreDefaults: false }, async () => {
-    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'all of it')] })
+    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'all of it')] })
     const payload = payloadOf((await h.invoke('')).text)
     assert.equal(payload.stats.ignore.builtIn, false)
     assert.equal(payload.stats.ignore.count, 0, 'nothing is excluded once the list is off')
@@ -1820,9 +2122,8 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(h.seen.prompts[0].messages[0].content[0].text.includes('DEPENDENCY_NEEDLE'))
   })
 
-  // A typed argument beats the config file in both directions.
   await withSettings({ ignoreDefaults: false }, async () => {
-    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'defaults back')] })
+    const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'defaults back')] })
     const result = await h.invoke('ignoreDefaults=true')
     assert.equal(payloadOf(result.text).stats.ignore.builtIn, true, '`ignoreDefaults=true` wins over the config')
     assert.equal(payloadOf(result.text).stats.reviewed, 1)
@@ -1845,7 +2146,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
           { name: 'list_dir', arguments: '{"path":"."}' },
         ],
       },
-      answer('fail', [{
+      record([{
         severity: 'major', category: 'correctness', file: hidden, line: 1,
         title: 'Dependency defect', problem: 'a claim about code the review excluded',
         impact: 'The reviewer would report on a dependency tree nobody asked about.',
@@ -1882,7 +2183,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   const h = harness({
     summary: { turn: 3, cwd: WS, total: 2, added: 3, deleted: 1, files },
     diffs: [TEXT_DIFF],
-    script: [answer('pass', [], 'session record')],
+    script: [record([], 'session record')],
   })
   const result = await h.invoke('session')
   assert.equal(result.kind, 'success', result.text)
@@ -1912,7 +2213,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     cwd: repo,
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('pass', [], 'never asked')],
+    script: [record([], 'never asked')],
   })
   const result = await h.invoke('')
   assert.equal(result.kind, 'error')
@@ -1940,7 +2241,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     writeFileSync(join(repo, path), `package p\n\nvar ${path.replace(/\W/g, '_')} = 2\n`)
   }
 
-  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [answer('pass', [], 'patterns')] })
+  const h = harness({ cwd: repo, hasEvent: false, diffs: [], script: [record([], 'patterns')] })
   const result = await h.invoke('ignored=/gen/,file[0-9].go,docs/**/*.md,sub/gen/,!sub/gen/b.go')
   const payload = payloadOf(result.text)
   const byFile = Object.fromEntries(payload.stats.ignore.sample.map(item => [item.file, item.rule]))
@@ -1981,8 +2282,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   }
   const text = `## Code review — PASS\n\nA summary.\n\n${MARKER}\n\`\`\`json\n${JSON.stringify(report)}\n\`\`\`\n`
   const card = await renderCard({ kind: 'success', text })
-  // The meta line is longer than the recorder keeps, so what proves the count
-  // here is the section itself: the label carries it and each row names its rule.
+  // The recorder truncates the meta line, so the section's own label and rows are what prove the count.
   assert.ok(card.texts.includes('label.ignored (2)'), 'the section names the count')
   assert.ok(card.texts.includes('node_modules/a.js — node_modules/'), 'and shows the rule behind each file')
   assert.ok(card.texts.includes('dist/b.js — dist/'))
@@ -2022,7 +2322,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
           { name: 'list_dir', arguments: '{"path":"generated"}' },
         ],
       },
-      answer('fail', [{
+      record([{
         severity: 'major', category: 'correctness', file: hidden, line: 3,
         title: 'Ignored file still readable', problem: 'a claim about a file the change set excluded',
         impact: 'A file the review took out of the diff comes back in through a read.',
@@ -2038,8 +2338,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(tool[0].content[0].text.includes("the repository's own ignore rules"), 'and names that layer')
   assert.ok(!tool[0].content[0].text.includes('REPO_NEEDLE'), 'the file is never read at all')
   assert.ok(tool[1].content[0].text.includes('no match for "REPO_NEEDLE"'), 'and a search cannot find it')
-  // The repository layer is a list of the paths git itself reports, so a
-  // directory name can still be listed; what must never show up is the file.
   assert.ok(!tool[2].content[0].text.includes('api.go'), 'the ignored file is in no listing')
   assert.ok(tool[3].content[0].text.includes('0 entries'), 'and its own directory lists empty')
   const payload = payloadOf(result.text)
@@ -2054,8 +2352,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   mkdirSync(join(home, '.dsh', 'code-review'), { recursive: true })
   writeFileSync(join(home, '.dsh', 'code-review', 'config.json'), JSON.stringify({ maxFiles: 1 }))
   const previous = { DSH_HOME: process.env.DSH_HOME, HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
-  // `dsh web` is started from wherever the user is, and its process may carry no
-  // DSH_HOME at all; the home is then `~/.dsh`, which is what os.homedir() reads.
+  // 'dsh web' may run with no DSH_HOME at all; the home is then '~/.dsh', which is what os.homedir() reads.
   delete process.env.DSH_HOME
   process.env.HOME = home
   process.env.USERPROFILE = home
@@ -2089,7 +2386,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   git(['add', '.gitignore', 'src/app.js'])
   git(['add', '-f', 'dist/bundle.js'])
   git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
-  // The session edits the committed, ignored bundle; someone else edits src.
   writeFileSync(join(repo, 'dist', 'bundle.js'), 'var bundle = 2\n')
   writeFileSync(join(repo, 'src', 'app.js'), 'export const a = 2\n')
   const root = realpathSync(repo)
@@ -2099,7 +2395,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     hasEvent: false,
     diffs: [],
     toolCalls: [{ name: 'write', arguments: { file_path: join(root, 'dist', 'bundle.js') } }],
-    script: [answer('pass', [], 'never asked')],
+    script: [record([], 'never asked')],
   })
   const result = await h.invoke('session')
   assert.equal(result.kind, 'error', result.text)
@@ -2108,15 +2404,13 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(!result.text.includes('none of them differs'), 'and the change is never called a no-op')
   assert.equal(h.seen.prompts.length, 0, 'no reviewer call is spent on it')
 
-  // An ignored file the session never touched is not this run's business: a
-  // session review that does have work reports no exclusion at all.
   writeFileSync(join(repo, 'src', 'app.js'), 'export const a = 3\n')
   const own = harness({
     cwd: repo,
     hasEvent: false,
     diffs: [],
     toolCalls: [{ name: 'write', arguments: { file_path: join(root, 'src', 'app.js') } }],
-    script: [answer('pass', [], 'session file only')],
+    script: [record([], 'session file only')],
   })
   const second = await own.invoke('session')
   assert.equal(second.kind, 'success', second.text)
@@ -2125,8 +2419,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.equal(payload.stats.ignore.count, 0, "another file's exclusion is not reported as this run's")
 }
 
-// 69 — a harness home that has never held a settings file gets one, written by
-// the plugin itself, and the run that created it is the run it decides.
+// 69 — a home that has never held a settings file gets one, written by the plugin itself, and that file decides the run that created it.
 {
   await withEmptyHome(async home => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
@@ -2134,21 +2427,19 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(existsSync(file), 'the plugin creates the file a new machine never had')
     const created = JSON.parse(readFileSync(file, 'utf8'))
     const { modes, ...documented } = created
-    const readme = readmeDefaults()
-    assert.deepEqual(documented, readme, 'the settings the file lists are exactly the block README documents')
-    assert.deepEqual(Object.keys(documented), Object.keys(readme), 'in the documented order')
+    assert.deepEqual(documented, DEFAULTS, 'the file holds exactly the settings this release declares')
+    assert.deepEqual(Object.keys(documented), Object.keys(DEFAULTS), 'in the order it declares them')
     assert.deepEqual(
       Object.keys(created),
-      [...Object.keys(readme), 'modes'],
-      'and the modes come last, so the block a reader knows is unchanged',
+      [...Object.keys(DEFAULTS), 'modes'],
+      'with the modes last, so the settings block a reader knows is unchanged',
     )
-    assert.deepEqual(modes, BUILT_IN_MODES, 'with the modes this release ships, prompts and all')
-    const shape = readmeModeShape()
-    assert.deepEqual(Object.keys(modes.cr), Object.keys(shape), 'a mode entry is what README says a mode entry is')
-    assert.deepEqual(Object.keys(modes.arc), Object.keys(shape))
-    assert.deepEqual(Object.keys(modes.cr.fields[0]), Object.keys(shape.fields[0]), 'and so is a field')
-    assert.deepEqual(Object.keys(modes.cr.severities[0]), Object.keys(shape.severities[0]), 'and a severity')
-    assert.deepEqual(Object.keys(DEFAULTS), Object.keys(readme), 'every documented key is one the plugin reads')
+    assert.deepEqual(modes, BUILT_IN_MODES, 'and the modes this release ships, prompts and all')
+    for (const [id, mode] of Object.entries(BUILT_IN_MODES)) {
+      assert.deepEqual(Object.keys(modes[id]), Object.keys(mode), `the written entry of "${id}" carries every key the mode declares`)
+    }
+    assert.deepEqual(Object.keys(modes.cr.fields[0]), Object.keys(BUILT_IN_MODES.cr.fields[0]), 'and so does a field')
+    assert.deepEqual(Object.keys(modes.cr.severities[0]), Object.keys(BUILT_IN_MODES.cr.severities[0]), 'and a severity')
     const payload = payloadOf((await h.invoke('')).text)
     assert.deepEqual(
       payload.reviewer,
@@ -2165,8 +2456,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 70 — a settings file removed while the harness is up is created again by the
-// run that needs it, instead of leaving the user without one until a restart.
+// 70 — a settings file removed while the harness is up is created again by the run that needs it.
 {
   await withEmptyHome(async home => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false })
@@ -2177,15 +2467,13 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(existsSync(file), 'the run put it back')
     const created = JSON.parse(readFileSync(file, 'utf8'))
     const { modes, ...settings } = created
-    assert.deepEqual(settings, readmeDefaults(), 'with the defaults again')
+    assert.deepEqual(settings, DEFAULTS, 'with the defaults again')
     assert.deepEqual(modes, BUILT_IN_MODES, 'and the built-in modes')
     assert.equal(payload.stats.reviewed, 1, 'and the run itself succeeded')
   })
 }
 
-// 71 — a hand-written file is completed, never overwritten: what the user wrote
-// still decides the run, a key of the user's own and the file's own order stand,
-// and a second load does not write a byte.
+// 71 — a hand-written file is completed, never overwritten: the user's keys and order stand, and a second load writes no byte.
 {
   await withEmptyHome(async home => {
     const file = settingsPath(home)
@@ -2210,8 +2498,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 72 — a file that does not parse is reported and left exactly as it is: the
-// plugin never repairs a user's file behind their back.
+// 72 — a file that does not parse is reported and left exactly as it is: the plugin never repairs a user's file behind their back.
 {
   await withEmptyHome(async home => {
     const file = settingsPath(home)
@@ -2250,13 +2537,12 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 74 — mode=arc runs the architecture role: its persona, its vocabulary, its
-// own word for the verdict, and the same contract no mode can change.
+// 74 — mode=arc runs the architecture role: its persona, its vocabulary, its own word for the verdict, and the same contract no mode can change.
 {
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('fail', [ARC_FINDING], 'The reset belongs to the caller.')],
+    script: [record([ARC_FINDING], 'The reset belongs to the caller.')],
   })
   const result = await h.invoke('mode=arc')
   assert.equal(result.kind, 'success', result.text)
@@ -2287,13 +2573,12 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(result.text.includes('(high 1)'), 'the severity counts use the mode\'s names')
 }
 
-// 75 — the fields a mode requires are what the gate enforces: arc asks for the
-// consequence and the alternative it proposes, not for a code review's impact.
+// 75 — the fields a mode requires are what the gate enforces: arc asks for the consequence and the alternative, not for a code review's impact.
 {
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('fail', [{ ...ARC_FINDING, alternative: '' }])],
+    script: [record([{ ...ARC_FINDING, alternative: '' }])],
   })
   const payload = payloadOf((await h.invoke('mode=arc')).text)
   assert.equal(payload.findings.length, 0)
@@ -2301,20 +2586,24 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(payload.withheld[0].reason.includes('Alternative'), payload.withheld[0].reason)
   assert.equal(payload.verdict, 'pass', 'a withheld finding never carries a verdict')
 
-  // The same finding with an impact but no consequence is still unproven here:
-  // the mode decides which fields a finding must state.
   const other = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('fail', [{ ...ARC_FINDING, consequence: '', impact: 'a real impact' }])],
+    script: [
+      { toolCalls: [toolCall('append_finding', { ...ARC_FINDING, consequence: '', impact: 'a real impact' })] },
+      record([{ ...ARC_FINDING, consequence: '' }]),
+    ],
   })
   const otherPayload = payloadOf((await other.invoke('mode=arc')).text)
+  const refusal = messagesOf(other.seen.prompts[1], 'tool')[0]
+  assert.equal(refusal.isError, true, 'a field the mode does not declare is refused')
+  assert.ok(refusal.content[0].text.includes('"impact" is not a finding field'), refusal.content[0].text)
+  assert.ok(refusal.content[0].text.includes('consequence'), 'and the refusal names what arc does accept')
   assert.equal(otherPayload.findings.length, 0)
   assert.ok(otherPayload.withheld[0].reason.includes('"consequence"'), otherPayload.withheld[0].reason)
 }
 
-// 76 — evidence is required in every mode: a mode that leaves it out of its
-// field list still gets it, and a finding without it is never published.
+// 76 — evidence is required in every mode, even one that leaves it out of its own field list.
 {
   await withSettings({
     modes: {
@@ -2329,9 +2618,9 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     const h = harness({
       summary: SUMMARY,
       diffs: [TEXT_DIFF, BINARY_DIFF],
-      script: [answer('warn', [{
+      script: [record([{
         severity: 'typo', category: 'spelling', file: 'internal/chessx/board.go',
-        title: 'Misspelled word', problem: 'boardu is not a word', correction: 'boardu → board', evidence: '',
+        title: 'Misspelled word', correction: 'boardu → board', evidence: '',
       }])],
     })
     const result = await h.invoke('mode=spell')
@@ -2341,14 +2630,18 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
       ['correction', 'evidence'],
       'the declared field stands, and evidence is appended because it was left out',
     )
+    assert.deepEqual(
+      h.seen.prompts[0].tools.find(tool => tool.name === 'append_finding').parameters.required,
+      ['severity', 'file', 'title', 'correction', 'evidence'],
+      'the tool asks for the quote the mode could not leave out',
+    )
     assert.equal(payload.findings.length, 0, 'a claim with no quote is not published')
     assert.equal(payload.withheld[0].reason, 'no evidence quoted')
     assert.ok(h.seen.prompts[0].system.includes('"evidence"'), 'and the contract asks for the quote')
   })
 }
 
-// 77 — a mode that does not exist is refused, with the modes that do, and no
-// model call is spent finding out.
+// 77 — a mode that does not exist is refused, with the modes that do, and no model call is spent finding out.
 {
   const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
   const result = await h.invoke('mode=nope')
@@ -2362,16 +2655,15 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
 // 78 — a mode answers to its aliases, in any case.
 {
   for (const typed of ['mode=architect', 'mode=architecture', 'mode=ARC', 'mode=Arc']) {
-    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
     const payload = payloadOf((await h.invoke(typed)).text)
     assert.equal(payload.mode.id, 'arc', `${typed} resolves to arc`)
   }
-  const aliased = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+  const aliased = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
   assert.equal(payloadOf((await aliased.invoke('mode=codereview')).text).mode.id, 'cr', 'and cr has aliases too')
 }
 
-// 79 — a mode the user wrote: its prompt, its fields, its severities and its own
-// settings, with no other focus area in the contract it is given.
+// 79 — a mode the user wrote: its prompt, its fields, its severities and its own settings, with no other focus area in the contract.
 {
   await withSettings({
     modes: {
@@ -2397,7 +2689,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
       diffs: [TEXT_DIFF, BINARY_DIFF],
       script: [
         { toolCalls: [{ name: 'read_file', arguments: JSON.stringify({ path: READ_ONLY_FILE }) }] },
-        answer('warn', [{
+        record([{
           severity: 'typo', category: 'spelling', file: 'internal/chessx/board.go', line: 13,
           title: 'boardu yazılmış', problem: 'boardu bir sözcük değil', correction: 'boardu → board', evidence: '+new',
         }], 'Bir yazım hatası.'),
@@ -2431,11 +2723,10 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 80 — what the file states wins over what this release ships, and the contract
-// is appended to it either way.
+// 80 — what the file states wins over what this release ships, and the contract is appended to it either way.
 {
   await withSettings({ modes: { cr: { systemPrompt: 'You are the hand-written reviewer.' } } }, async () => {
-    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
     const result = await h.invoke('')
     const system = h.seen.prompts[0].system
     assert.ok(system.startsWith('You are the hand-written reviewer.'), 'the file\'s persona is the one sent')
@@ -2452,14 +2743,13 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 81 — the file is completed, never rewritten: a release mode comes back whole,
-// a mode of the user's own is left exactly as it is, and nothing is written twice.
+// 81 — the file is completed, never rewritten: a release mode comes back whole and a mode of the user's own is left as it is.
 {
   await withEmptyHome(async home => {
     const file = settingsPath(home)
     mkdirSync(dirname(file), { recursive: true })
     writeFileSync(file, `${JSON.stringify({ modes: { cr: { label: 'My review' }, mine: { label: 'Mine' } } }, null, 2)}\n`)
-    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false, script: [answer('pass', [], 'ok')] })
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false, script: [record([], 'ok')] })
     const payload = payloadOf((await h.invoke('')).text)
     assert.equal(payload.mode.label, 'My review', 'the label the file states wins')
     const doc = JSON.parse(readFileSync(file, 'utf8'))
@@ -2469,14 +2759,13 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.deepEqual(Object.keys(doc.modes.mine), ['label'], 'a mode of the user\'s own is never extended')
     assert.equal(doc.modes.arc.settings.maxToolCalls, 60, 'the architecture preset is in the file, where it can be changed')
     const after = readFileSync(file, 'utf8')
-    const again = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false, script: [answer('pass', [], 'ok')] })
+    const again = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], git: false, script: [record([], 'ok')] })
     await again.invoke('')
     assert.equal(readFileSync(file, 'utf8'), after, 'a file with nothing missing is not written to at all')
   })
 }
 
-// 82 — a disabled mode is not offered, and a disabled default falls back loudly
-// rather than leaving `/review` unusable.
+// 82 — a disabled mode is not offered, and a disabled default falls back loudly rather than leaving /review unusable.
 {
   await withSettings({ modes: { arc: { enabled: false } } }, async () => {
     const refused = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
@@ -2489,15 +2778,13 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
 
   const { value, warnings } = await withSettings({ mode: 'arc', modes: { arc: { enabled: false } } }, async () => {
     return captureWarnings(async () => {
-      const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+      const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
       return payloadOf((await h.invoke('')).text)
     })
   })
   assert.equal(value.mode.id, 'cr', 'a bare /review still runs the default mode')
   assert.ok(warnings.some(line => line.includes('is disabled')), warnings.join('\n'))
 
-  // A file that switches everything off has nothing to run, and says so rather
-  // than picking a mode the user took off the surface.
   await withSettings({ modes: { cr: { enabled: false }, arc: { enabled: false } } }, async () => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
     const result = await h.invoke('')
@@ -2507,8 +2794,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 83 — a mode's settings are a preset: they win over the file's own, and what is
-// typed after /review wins over both.
+// 83 — a mode's settings are a preset: they win over the file's own, and what is typed after /review wins over both.
 {
   await withSettings({
     language: 'en',
@@ -2520,7 +2806,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
       diffs: [TEXT_DIFF, BINARY_DIFF],
       script: [
         { toolCalls: [{ name: 'read_file', arguments: JSON.stringify({ path: READ_ONLY_FILE }) }] },
-        answer('pass', [], 'ok'),
+        record([], 'ok'),
       ],
     })
     await h.invoke('')
@@ -2529,7 +2815,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     const footer = messagesOf(h.seen.prompts[1], 'tool')[0].content[0].text
     assert.ok(footer.includes('1/4 calls'), 'and a setting the mode does not preset is the file\'s')
 
-    const typed = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    const typed = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
     await typed.invoke('language=en')
     assert.ok(
       typed.seen.prompts[0].messages[0].content[0].text.includes('in "en".'),
@@ -2538,8 +2824,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 84 — a mode written wrong is reported and run with what is usable: junk keys,
-// reserved field names and settings a mode may not set are named, never obeyed.
+// 84 — a mode written wrong is reported and run with what is usable: junk keys, reserved field names and forbidden settings are named, never obeyed.
 {
   await withSettings({
     modes: {
@@ -2558,7 +2843,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
       const h = harness({
         summary: SUMMARY,
         diffs: [TEXT_DIFF, BINARY_DIFF],
-        script: [answer('warn', [{
+        script: [record([{
           severity: 'weird', category: 'general', file: 'internal/chessx/board.go',
           title: 'T', problem: 'p', evidence: '+new',
         }])],
@@ -2579,20 +2864,17 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(warnings.some(line => line.includes('is not a setting this plugin reads')), warnings.join('\n'))
     assert.ok(warnings.some(line => line.includes('cannot be set by a mode')), warnings.join('\n'))
     assert.ok(warnings.some(line => line.includes('declared twice')), warnings.join('\n'))
-    // The one thing a severity table may not do quietly: claim a verdict or a
-    // tone that does not exist. Both are named and the usable part runs.
     assert.ok(warnings.some(line => line.includes('verdict "whatever"')), warnings.join('\n'))
     assert.ok(warnings.some(line => line.includes('tone "rainbow"')), warnings.join('\n'))
   })
 }
 
-// 85 — the card draws whatever mode the payload describes, and still cannot
-// send anything.
+// 85 — the card draws whatever mode the payload describes, and still cannot send anything.
 {
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('fail', [ARC_FINDING], 'The reset belongs to the caller.')],
+    script: [record([ARC_FINDING], 'The reset belongs to the caller.')],
   })
   const result = await h.invoke('mode=arc')
   const card = await renderCard({ kind: 'success', text: result.text })
@@ -2609,11 +2891,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     'a mode changes what the card says, never what it can do',
   )
 
-  // The same card path, on the mode that ships as the default: the vocabulary
-  // travels in the payload, so the card needs no branch for either of them. The
-  // long fields are asserted through the copy, which is the same renderer the
-  // report uses.
-  const cr = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('fail', [PROVEN], 'Nil board.')] })
+  const cr = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([PROVEN], 'Nil board.')] })
   const crText = (await cr.invoke('')).text
   const crCard = await renderCard({ kind: 'success', text: crText })
   assert.ok(crCard.texts.includes('Code review'), 'the default mode titles its card from the payload')
@@ -2627,22 +2905,20 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   assert.ok(pasted.includes(`**Impact:** ${PROVEN.impact}`), 'in the mode\'s own order and wording')
 }
 
-// 86 — the file decides which mode a bare /review runs, and the command line
-// still overrides it.
+// 86 — the file decides which mode a bare /review runs, and the command line still overrides it.
 {
   await withSettings({ mode: 'arc' }, async () => {
-    const bare = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    const bare = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
     assert.equal(payloadOf((await bare.invoke('')).text).mode.id, 'arc', 'the configured mode runs')
-    const typed = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    const typed = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
     assert.equal(payloadOf((await typed.invoke('mode=cr')).text).mode.id, 'cr', 'and a typed mode wins')
   })
 }
 
-// 87 — a mode with no persona is still a working mode: the contract alone is the
-// system prompt, and the minimum field set is what a finding must state.
+// 87 — a mode with no persona is still a working mode: the contract alone is the system prompt.
 {
   await withSettings({ modes: { bare: { systemPrompt: '', task: '', fields: [] } } }, async () => {
-    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [answer('pass', [], 'ok')] })
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], 'ok')] })
     const result = await h.invoke('mode=bare')
     const system = h.seen.prompts[0].system
     assert.ok(system.startsWith('## Reading the project'), 'the contract is the whole system prompt')
@@ -2659,9 +2935,7 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
   })
 }
 
-// 88 — a severity table is read by weight, not by position: a mode that lists its
-// severities strongest-last still lowers an undeclared one to the weakest, and a
-// substitution never raises the verdict.
+// 88 — a severity the mode does not declare is refused by name, never lowered or substituted, and the verdict follows the mode's table whatever order it is written in.
 {
   await withSettings({
     modes: {
@@ -2676,45 +2950,56 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
       },
     },
   }, async () => {
-    const { value: payload, warnings } = await captureWarnings(async () => {
-      const h = harness({
-        summary: SUMMARY,
-        diffs: [TEXT_DIFF, BINARY_DIFF],
-        script: [answer('fail', [{
-          severity: 'catastrophic', category: 'general', file: 'internal/chessx/board.go',
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      script: [
+        {
+          toolCalls: [toolCall('append_finding', {
+            severity: 'catastrophic', category: 'general', file: 'internal/chessx/board.go',
+            title: 'Nothing declares this', problem: 'p', evidence: '+new',
+          })],
+        },
+        record([{
+          severity: 'high', category: 'general', file: 'internal/chessx/board.go',
           title: 'Nothing declares this', problem: 'p', evidence: '+new',
-        }])],
-      })
-      return payloadOf((await h.invoke('mode=upside')).text)
+        }]),
+      ],
     })
-    assert.equal(payload.findings.length, 1, 'the finding is still gated on its own merits')
-    assert.equal(
-      payload.findings[0].severity,
-      'low',
-      'the entry that claims least, not the last one the file happens to list',
+    const payload = payloadOf((await h.invoke('mode=upside')).text)
+    const refusal = messagesOf(h.seen.prompts[1], 'tool')[0]
+    assert.equal(refusal.isError, true, 'an undeclared severity is refused, not lowered')
+    assert.ok(refusal.content[0].text.includes('"catastrophic" is not a severity of mode "upside"'), refusal.content[0].text)
+    assert.ok(refusal.content[0].text.includes('low, high'), 'and the refusal names the table it does declare')
+    assert.deepEqual(
+      h.seen.prompts[0].tools.find(tool => tool.name === 'append_finding').parameters.properties.severity.enum,
+      ['low', 'high'],
+      'the table is the tool’s enum, in the order the file wrote it',
     )
-    assert.equal(payload.verdict, 'pass', 'a substitution claims the least it can, so it cannot raise the verdict')
-    assert.ok(warnings.some(line => line.includes('catastrophic')), warnings.join('\n'))
+    assert.equal(payload.findings.length, 1, 'the corrected call is gated on its own merits')
+    assert.equal(payload.findings[0].severity, 'high', 'and the severity the mode declares is the one recorded')
+    assert.equal(payload.verdict, 'fail', 'the verdict follows the table, not the position the entry is listed in')
+    assert.equal(messagesOf(h.seen.prompts[1], 'tool').filter(message => message.isError === true).length, 1, 'the refused call changed nothing')
   })
 
-  // The table a release ships is written weakest-last, so the fallback lands
-  // where it always did: cr's undeclared severity is still a nit.
   const h = harness({
     summary: SUMMARY,
     diffs: [TEXT_DIFF, BINARY_DIFF],
-    script: [answer('warn', [{ ...PROVEN, severity: 'severe' }])],
+    script: [
+      { toolCalls: [toolCall('append_finding', { ...PROVEN, severity: 'severe' })] },
+      record([{ ...PROVEN, severity: 'nit' }]),
+    ],
   })
   const payload = payloadOf((await h.invoke('')).text)
-  assert.equal(payload.findings[0].severity, 'nit', 'the weakest end of the default table is unchanged')
-  assert.equal(payload.verdict, 'warn', 'and it still lands as a warning, never as a failure')
+  const refusal = messagesOf(h.seen.prompts[1], 'tool')[0]
+  assert.ok(refusal.content[0].text.includes('"severe" is not a severity of mode "cr"'), refusal.content[0].text)
+  assert.ok(refusal.content[0].text.includes('blocker, major, minor, nit'), 'the cr table is named in full')
+  assert.equal(payload.findings[0].severity, 'nit', 'the call the reviewer fixed is the one that lands')
+  assert.equal(payload.verdict, 'warn', 'and a nit is a warning, never a failure')
 }
 
-// 89 — the thinking level of a run: the config file and the mode preset carry
-// it, the command line overrides both, an empty layer presets nothing, and a
-// level the model does not offer is refused before a single call is spent.
+// 89 — the thinking level comes from the config file and the mode preset, the command line overrides both, and a level the model does not offer costs no call.
 {
-  // A fresh file carries the key, and a run that names no level sends none at
-  // all — the provider's own default is what decides there.
   await withEmptyHome(async home => {
     const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
     const created = JSON.parse(readFileSync(settingsPath(home), 'utf8'))
@@ -2725,7 +3010,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(!text.includes('thinking:'), 'nor does the report name a level nobody chose')
   })
 
-  // The mode's preset beats the file's value; what is typed beats them both.
   await withSettings({
     reasoningEffort: 'low',
     modes: { cr: { settings: { reasoningEffort: 'max' } } },
@@ -2741,7 +3025,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.equal(typed.seen.prompts[0].reasoningEffort, 'off', 'and what is typed beats them both')
   })
 
-  // An empty layer states no preference: it never erases the value below it.
   await withSettings({
     reasoningEffort: 'low',
     modes: { cr: { settings: { reasoningEffort: '' } } },
@@ -2751,8 +3034,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.equal(h.seen.prompts[0].reasoningEffort, 'low', 'an empty preset leaves the file in force')
   })
 
-  // A level the model does not offer is refused with the levels it does, and
-  // the refusal costs no model call — the rule an unknown mode already follows.
   await withSettings({ reasoningEffort: 'ultra' }, async () => {
     const offered = harness({
       summary: SUMMARY,
@@ -2771,8 +3052,6 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.ok(bareResult.text.includes('declares no reasoning levels'), bareResult.text)
     assert.equal(bare.seen.prompts.length, 0)
 
-    // A route the adapter cannot describe is left to the call itself: the
-    // setting still reaches the request, exactly as it did before the check.
     const unknown = harness({
       summary: SUMMARY,
       diffs: [TEXT_DIFF, BINARY_DIFF],
@@ -2782,6 +3061,1181 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.equal(result.kind, 'success', result.text)
     assert.equal(unknown.seen.prompts[0].reasoningEffort, 'ultra', 'an undescribable route is not second-guessed')
   })
+}
+
+// 90 — the six review tools are the protocol: the same names in the same order under every setting, mode and command line.
+{
+  await withSettings({}, async () => {
+    for (const [what, args] of [['a bare run', ''], ['an alias', 'mode=codereview']]) {
+      const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+      await h.invoke(args)
+      assert.deepEqual(
+        h.seen.prompts[0].tools.map(tool => tool.name),
+        [...REVIEW_TOOL_NAMES, ...READER_TOOL_NAMES],
+        `every tool is offered: ${what}`,
+      )
+      assert.equal(assertOneReading(h.seen.prompts[0], what), true, 'and the contract of the run claims them')
+    }
+  })
+
+  await withSettings({ projectAccess: false, maxToolCalls: 1, timeoutMs: 1000, toolDeadlineRatio: 0.0000001 }, async () => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+    await h.invoke('')
+    assert.deepEqual(
+      h.seen.prompts[0].tools.map(tool => tool.name),
+      REVIEW_TOOL_NAMES,
+      'the review tools survive every setting that narrows the reader',
+    )
+    assert.equal(assertOneReading(h.seen.prompts[0], 'every reader bound is closed'), false, 'and the contract claims no reading')
+  })
+
+  await withSettings({
+    modes: { cr: { settings: { tools: [], append_finding: false, reviewTools: ['nothing'], finish_review: 'off' } } },
+  }, async () => {
+    const { value: payload, warnings } = await captureWarnings(async () => {
+      const h = harness({
+        summary: SUMMARY,
+        diffs: [TEXT_DIFF, BINARY_DIFF],
+        script: [record([PROVEN], 'nothing was switched off')],
+      })
+      return { payload: payloadOf((await h.invoke('')).text), prompts: h.seen.prompts }
+    })
+    assert.deepEqual(
+      payload.prompts[0].tools.map(tool => tool.name),
+      [...REVIEW_TOOL_NAMES, ...READER_TOOL_NAMES],
+      'the tools a mode tried to configure are still the ones offered',
+    )
+    assert.equal(payload.payload.findings.length, 1, 'and the review is recorded as usual')
+    const ignored = warnings.filter(line => line.includes('is not a setting this plugin reads'))
+    assert.equal(ignored.length, 4, `every tool-setting key is reported and ignored: ${warnings.join(' | ')}`)
+  })
+}
+
+// 91 — a call the store cannot use is refused with everything that was wrong with it, changes nothing, and the run carries on.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('append_finding', PROVEN)] },
+      {
+        toolCalls: [
+          { name: 'append_finding', arguments: '{"severity":' },
+          { name: 'append_finding', arguments: '["blocker"]' },
+          toolCall('append_finding', { ...PROVEN, impactt: 'a typo of the field name' }),
+          toolCall('append_finding', { ...PROVEN, line: '13' }),
+          toolCall('update_finding', { title: 'no id' }),
+          toolCall('update_finding', { id: 'f9', title: 'gone' }),
+          toolCall('update_finding', { id: 'f1' }),
+          toolCall('delete_finding', { id: 'f9' }),
+          toolCall('list_findings', { limit: 5 }),
+          toolCall('set_summary', { summary: '   ' }),
+          toolCall('finish_review', { summary: 'wrong tool for this' }),
+        ],
+      },
+      { toolCalls: [toolCall('finish_review', {})] },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  const tool = messagesOf(h.seen.prompts[2], 'tool')
+  assert.equal(tool.length, 12, 'the recorded finding and every refused call got exactly one result')
+  const refused = tool.slice(1)
+  assert.deepEqual(refused.map(message => message.isError), Array.from({ length: 11 }, () => true), 'all eleven are refusals')
+  const expected = [
+    'cannot parse arguments for append_finding',
+    'must be a JSON object',
+    '"impactt" is not a finding field',
+    '"line" must be a whole line number',
+    'needs the "id"',
+    'no finding "f9"',
+    'at least one field to change',
+    'no finding "f9"',
+    'takes no arguments',
+    'non-empty "summary"',
+    'takes no arguments',
+  ]
+  refused.forEach((message, index) => {
+    assert.ok(message.content[0].text.includes(expected[index]), `refusal ${index}: ${message.content[0].text}`)
+  })
+  assert.ok(refused[2].content[0].text.includes('problem, impact, trigger'), 'an unknown key answers with the keys that exist')
+  assert.ok(refused[5].content[0].text.includes('recorded: f1 (Guard the nil board)'), 'an unknown id answers with the ids that exist')
+  assert.ok(refused[10].content[0].text.includes('set_summary'), 'and the finish refusal says where the summary belongs')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1, 'nothing the refusals carried reached the store')
+  assert.equal(payload.findings[0].title, 'Guard the nil board')
+  assert.deepEqual(payload.stats.store, { calls: 11, appended: 1, updated: 0, deleted: 0 }, 'the refused calls that reached the store are counted, and changed nothing')
+}
+
+// 92 — the evidence corpus only grows: a finding recorded before the file behind it was read is published once the read has happened.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      {
+        toolCalls: [toolCall('append_finding', {
+          severity: 'major', category: 'correctness', file: READ_ONLY_FILE, line: 4,
+          title: 'Reset from the caller', problem: 'the caller resets a board it just built',
+          impact: 'Every game started through this path begins from an empty position.',
+          trigger: 'Any caller of Apply reaches Reset first, so the first move is rejected.',
+          suggestion: 'do not reset here', evidence: READ_ONLY_LINE,
+        })],
+      },
+      { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] },
+      record([], 'read after recording'),
+    ],
+  })
+  const result = await h.invoke('')
+  const recorded = messagesOf(h.seen.prompts[1], 'tool')[0]
+  assert.equal(recorded.isError, undefined, 'a finding the gate cannot publish is still recorded')
+  assert.ok(recorded.content[0].text.includes('recorded, withheld:'), recorded.content[0].text)
+  assert.ok(recorded.content[0].text.includes('not one the reviewer could see'), recorded.content[0].text)
+  assert.ok(recorded.content[0].text.includes('update_finding on f1'), 'and the reviewer is told how to fix it')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1, 'the read that followed made it provable')
+  assert.deepEqual(payload.withheld, [])
+  assert.equal(payload.stats.store.appended, 1)
+}
+
+// 93 — update and delete are how a finding a later look invalidated leaves the review: the id addresses it and the order never moves.
+{
+  const second = { ...PROVEN, severity: 'minor', title: 'A second finding', evidence: '+extra' }
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('append_finding', PROVEN), toolCall('append_finding', second)] },
+      {
+        toolCalls: [
+          toolCall('update_finding', { id: 'f1', severity: 'nit', title: 'Guard the board' }),
+          toolCall('delete_finding', { id: 'f2' }),
+          toolCall('list_findings', {}),
+        ],
+      },
+      record([], 'one finding left'),
+    ],
+  })
+  const result = await h.invoke('')
+  const tool = messagesOf(h.seen.prompts[2], 'tool')
+  assert.equal(tool.length, 5, 'two records, then the update, the delete and the listing, each with a result')
+  assert.ok(tool[2].content[0].text.includes('f1 [nit]'), tool[2].content[0].text)
+  assert.ok(tool[2].content[0].text.includes('updated (severity, title)'), tool[2].content[0].text)
+  assert.ok(tool[3].content[0].text.includes('f2 [minor]'), tool[3].content[0].text)
+  assert.ok(tool[3].content[0].text.includes('deleted'), tool[3].content[0].text)
+  const listed = tool[4].content[0].text
+  assert.ok(listed.includes('f1 [nit] internal/chessx/board.go:13 — Guard the board · provable'), listed)
+  assert.ok(!listed.includes('f2'), 'the deleted finding is gone from the listing')
+  assert.ok(listed.includes('[finding store: 1 of 100 recorded'), listed)
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1, 'the report holds what the store holds')
+  assert.equal(payload.findings[0].title, 'Guard the board')
+  assert.equal(payload.findings[0].severity, 'nit')
+  assert.equal(payload.verdict, 'warn', 'and the corrected severity is what the verdict follows')
+  assert.deepEqual(payload.stats.store, { calls: 7, appended: 2, updated: 1, deleted: 1 })
+}
+
+// 94 — a run the stream cut off keeps every finding already recorded and hands them over as a partial report that says so.
+{
+  await withSettings({ notifyAgent: 'steer' }, async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      failAtCall: 3,
+      failWith: 'socket hang up',
+      script: [
+        { toolCalls: [toolCall('append_finding', PROVEN), toolCall('set_summary', { summary: 'Two findings so far.' })] },
+        { toolCalls: [toolCall('append_finding', { ...PROVEN, severity: 'minor', title: 'Second', evidence: '+extra' })] },
+      ],
+    })
+    const result = await h.invoke('')
+    assert.equal(result.kind, 'success', result.text)
+    assert.equal(h.seen.prompts.length, 3, 'the run stopped where the stream did, and did not retry on top of a recorded finding')
+    const payload = payloadOf(result.text)
+    assert.equal(payload.findings.length, 2, 'both findings recorded before the failure survived it')
+    assert.ok(payload.incomplete.includes('socket hang up'), payload.incomplete)
+    assert.ok(result.text.includes('- incomplete: the reviewer call failed'), 'the report leads with what happened')
+    assert.ok(result.text.includes('Two findings so far.'), 'and keeps the summary that was recorded')
+    assert.equal(payload.verdict, 'fail', 'the verdict is still computed from what survived')
+    const notice = h.seen.steer[0].content[0].text
+    assert.ok(notice.includes('this review is incomplete'), notice)
+    assert.ok(notice.includes('socket hang up'), notice)
+    assert.ok(h.seen.steer[0].source.summary.includes('incomplete'), 'and the inbox line says so too')
+  })
+}
+
+// 95 — a failure that leaves nothing recorded is an error, and a run gets one retry, never a second one on top of a stored finding.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    failAtCall: [1, 2],
+    failWith: 'provider unreachable',
+    script: [record([PROVEN], 'never reached')],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'error', result.text)
+  assert.ok(result.text.includes('recorded no finding'), result.text)
+  assert.ok(result.text.includes('provider unreachable'), result.text)
+  assert.ok(result.text.includes('can call tools'), 'and points at what the review needs from a route')
+  assert.equal(h.seen.prompts.length, 2, 'the failed call and one retry, nothing more')
+}
+
+// 95b — a stream that breaks after a fruitless turn is an error too: there is no conclusion and no partial report to make.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    failAtCall: 2,
+    failWith: 'socket closed',
+    script: [{ toolCalls: [toolCall('list_findings', {})] }],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'error', result.text)
+  assert.ok(result.text.includes('socket closed'), result.text)
+}
+
+// 96 — a model that stops without finishing is asked to finish, and when it will not, the report is built from the store and marked incomplete.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('append_finding', PROVEN), toolCall('set_summary', { summary: 'partly done' })] },
+      { text: 'I think that is everything.' },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  assert.equal(h.seen.prompts.length, 4, 'the recording turn, then two nudges before the run gives up')
+  const nudges = messagesOf(h.seen.prompts[3], 'user').filter(message => message.content[0].text.includes('not finished'))
+  assert.equal(nudges.length, 2, 'the model is asked to finish every time it stops')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1)
+  assert.equal(payload.incomplete, 'the reviewer stopped without calling finish_review')
+  assert.ok(result.text.includes('- incomplete: the reviewer stopped without calling finish_review'), result.text)
+}
+
+// 97 — a cancelled run keeps what it recorded and says it was cancelled; a cancel before anything was recorded still refuses.
+{
+  const cancelled = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    abortAtCall: 2,
+    script: [{ toolCalls: [toolCall('append_finding', PROVEN)] }],
+  })
+  const result = await cancelled.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1, 'the finding recorded before the cancel survived')
+  assert.equal(payload.incomplete, 'the review was cancelled')
+
+  const empty = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    abortAtCall: 1,
+    script: [record([PROVEN], 'never reached')],
+  })
+  const refused = await empty.invoke('')
+  assert.equal(refused.kind, 'error', refused.text)
+  assert.ok(refused.text.includes('review cancelled'), refused.text)
+}
+
+// 98 — the loop always ends: a model that keeps calling tools without finishing meets the run's own turn limit.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('append_finding', PROVEN)] },
+      { toolCalls: [toolCall('list_findings', {})] },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  assert.equal(h.seen.prompts.length, 150, 'the run stops at its own turn limit')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1, 'the finding recorded on the way is still the review')
+  assert.ok(payload.incomplete.includes("kept working past this run's 150 model turns"), payload.incomplete)
+  assert.equal(payload.stats.store.calls, 150, 'one call per turn, every one of them answered')
+}
+
+// 99 — the store has a ceiling, and reaching it changes nothing already recorded.
+{
+  const appends = Array.from({ length: 101 }, (_, index) => toolCall('append_finding', {
+    ...PROVEN, title: `Finding ${index + 1}`,
+  }))
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: appends },
+      { toolCalls: [toolCall('finish_review', {})] },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  const refusals = messagesOf(h.seen.prompts[1], 'tool').filter(message => message.isError === true)
+  assert.equal(refusals.length, 1, 'only the call over the ceiling is refused')
+  assert.ok(refusals[0].content[0].text.includes('already holds 100 findings, the maximum'), refusals[0].content[0].text)
+  assert.ok(refusals[0].content[0].text.includes('delete_finding'), 'and it says how to make room')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 100, 'the store holds its hundred')
+  assert.equal(payload.findings[0].title, 'Finding 1')
+  assert.equal(payload.findings.at(-1).title, 'Finding 100')
+}
+
+// 99b — the finding-tool call cap closes the store without closing the review: the calls that inspect, describe and end it still work, and the report names the cap.
+{
+  const lists = Array.from({ length: 300 }, () => toolCall('list_findings', {}))
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('append_finding', PROVEN), ...lists] },
+      {
+        toolCalls: [
+          toolCall('append_finding', { ...PROVEN, title: 'Too late' }),
+          toolCall('update_finding', { id: 'f1', severity: 'nit' }),
+          toolCall('list_findings', {}),
+          toolCall('set_summary', { summary: 'one finding, then the cap' }),
+        ],
+      },
+      { toolCalls: [toolCall('finish_review', {})] },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  assert.equal(h.seen.prompts.length, 3, 'the run closed on the reviewer’s own terms')
+  const over = messagesOf(h.seen.prompts[2], 'tool').slice(301)
+  assert.equal(over.length, 4, 'the calls past the cap each got one result')
+  assert.deepEqual(over.slice(0, 2).map(message => message.isError), [true, true], 'a change to the review is refused')
+  assert.ok(over[0].content[0].text.includes('300 finding-tool calls'), over[0].content[0].text)
+  assert.ok(over[0].content[0].text.includes('list_findings'), 'and the refusal points at the calls that still work')
+  assert.equal(over[2].isError, undefined, 'listing what is recorded still works')
+  assert.ok(over[2].content[0].text.includes('f1 [blocker]'), over[2].content[0].text)
+  assert.equal(over[3].isError, undefined, 'and so does recording the summary')
+  assert.ok(over[3].content[0].text.includes('summary recorded'), over[3].content[0].text)
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1, 'what was recorded before the cap is the review')
+  assert.equal(payload.summary, 'one finding, then the cap', 'the summary recorded past the cap opens the report')
+  assert.equal(payload.incomplete, 'the reviewer used its 300 finding-tool calls before it closed the review')
+  assert.ok(result.text.includes('- incomplete: the reviewer used its 300 finding-tool calls'), result.text)
+}
+
+// 99c — a capped run that never finishes still names the cap, and a capped run that recorded nothing is an error that does not blame the route.
+{
+  const lists = Array.from({ length: 300 }, () => toolCall('list_findings', {}))
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('append_finding', PROVEN), ...lists] },
+      { toolCalls: [toolCall('append_finding', { ...PROVEN, title: 'Too late' })] },
+      { text: 'that is all' },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1, 'the finding recorded before the cap survives')
+  assert.ok(payload.incomplete.startsWith('the reviewer stopped without calling finish_review'), payload.incomplete)
+  assert.ok(payload.incomplete.includes('the store had already taken its 300 finding-tool calls'), payload.incomplete)
+
+  const empty = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: lists },
+      { toolCalls: [toolCall('append_finding', PROVEN)] },
+      { text: 'nothing to report' },
+    ],
+  })
+  const refused = await empty.invoke('')
+  assert.equal(refused.kind, 'error', refused.text)
+  assert.ok(refused.text.includes('300 finding-tool calls'), refused.text)
+  assert.ok(!refused.text.includes('can call tools'), 'the route is not blamed for a cap the model reached')
+}
+
+// 100 — finish_review ends the review: a call after it in the same turn is refused, and the report is what was recorded before it.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      {
+        toolCalls: [
+          toolCall('append_finding', PROVEN),
+          toolCall('finish_review', {}),
+          toolCall('append_finding', { ...PROVEN, title: 'Too late' }),
+        ],
+      },
+      { text: 'done' },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(h.seen.prompts.length, 1, 'the loop ended with the finished review')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1)
+  assert.equal(payload.findings[0].title, 'Guard the nil board', 'the call after the finish did not land')
+  assert.deepEqual(payload.stats.store, { calls: 3, appended: 1, updated: 0, deleted: 0 }, 'and it is counted as a refusal')
+}
+
+// 101 — set_summary opens the report, the last one wins, and a review that records none says so instead of inventing one.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      {
+        toolCalls: [
+          toolCall('set_summary', { summary: 'first' }),
+          toolCall('set_summary', { summary: 'second' }),
+          toolCall('set_summary', { summary: 'third' }),
+        ],
+      },
+      { toolCalls: [toolCall('finish_review', {})] },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(payloadOf(result.text).summary, 'third', 'the last summary is the one kept')
+  const tool = messagesOf(h.seen.prompts[1], 'tool')
+  assert.ok(tool[0].content[0].text.includes('summary recorded'), tool[0].content[0].text)
+  assert.ok(tool[1].content[0].text.includes('summary replaced'), tool[1].content[0].text)
+
+  const bare = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script: [record([], null)] })
+  const bareResult = await bare.invoke('')
+  assert.equal(payloadOf(bareResult.text).summary, '', 'no summary was recorded, and none was invented')
+  assert.ok(bareResult.text.includes('(no summary returned)'), bareResult.text)
+}
+
+// 102 — the card shows that a review stopped early, and still offers nothing but the copy actions.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    failAtCall: 2,
+    failWith: 'socket hang up',
+    script: [{ toolCalls: [toolCall('append_finding', PROVEN)] }],
+  })
+  const text = (await h.invoke('')).text
+  const card = await renderCard({ kind: 'success', text })
+  assert.ok(card.texts.includes('state.partial'), 'the card marks the review incomplete')
+  assert.ok(
+    card.texts.some(entry => entry.includes('socket hang up')),
+    `and names the reason: ${card.texts.join(' | ')}`,
+  )
+  assert.ok(card.texts.includes('Guard the nil board'), 'while still drawing the finding that was recorded')
+  assert.deepEqual(
+    card.buttons,
+    ['action.copyReport', 'toggle.hide', 'action.copyFinding'],
+    'a review that stopped early adds no control that could send anything',
+  )
+}
+
+// 103 — the tool a mode gets carries that mode's own vocabulary: its severity ids, its fields in its order, its guides as the parameter descriptions.
+{
+  await withSettings({
+    modes: {
+      misspell: {
+        label: 'Spelling review',
+        fields: [
+          { key: 'problem', label: '', required: true, guide: 'the wrong word and what it should be' },
+          { key: 'correction', label: 'Correction', required: true, guide: 'the corrected text verbatim' },
+        ],
+        severities: [{ id: 'typo', label: 'typo', tone: 'muted', verdict: 'warn', meaning: 'a misspelled word' }],
+      },
+    },
+  }, async () => {
+    const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+    const result = await h.invoke('mode=misspell')
+    assert.equal(result.kind, 'success', result.text)
+    const append = h.seen.prompts[0].tools.find(tool => tool.name === 'append_finding')
+    assert.deepEqual(
+      Object.keys(append.parameters.properties),
+      ['severity', 'category', 'file', 'line', 'title', 'problem', 'correction', 'evidence'],
+      'the finding shape is the structure plus the mode’s fields, in the mode’s order',
+    )
+    assert.deepEqual(append.parameters.properties.severity.enum, ['typo'], 'one severity, no room to inflate')
+    assert.deepEqual(append.parameters.required, ['severity', 'file', 'title', 'problem', 'correction', 'evidence'])
+    assert.ok(
+      append.parameters.properties.correction.description.includes('the corrected text verbatim'),
+      'the field’s guide is the parameter’s description',
+    )
+    const update = h.seen.prompts[0].tools.find(tool => tool.name === 'update_finding')
+    assert.deepEqual(update.parameters.required, ['id'], 'update takes an id and whatever changes')
+    assert.ok(Object.hasOwn(update.parameters.properties, 'correction'), 'and the mode’s fields too')
+    assert.deepEqual(
+      h.seen.prompts[0].tools.filter(tool => ['list_findings', 'finish_review'].includes(tool.name)).map(tool => Object.keys(tool.parameters.properties)),
+      [[], []],
+      'the two tools that take nothing declare nothing',
+    )
+  })
+}
+
+// 104 — the finding structure is closed to the modes: a mode that declares a structural key is told so, and the store's meaning for that key stands.
+{
+  const reserved = ['severity', 'category', 'file', 'line', 'title', 'summary', 'id']
+  const fields = [...reserved.map(key => ({ key, label: `Mine: ${key}` })), { key: 'problem' }]
+  await withSettings({ modes: { odd: { fields } } }, async () => {
+    const { value: payload, warnings } = await captureWarnings(async () => {
+      const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF] })
+      return payloadOf((await h.invoke('mode=odd')).text)
+    })
+    assert.deepEqual(payload.mode.fields.map(field => field.key), ['problem', 'evidence'], 'no structural key becomes a field')
+    for (const key of reserved) {
+      assert.ok(
+        warnings.some(line => line.includes(`"${key}" is part of the finding structure`)),
+        `"${key}" is refused as a field key: ${warnings.join(' | ')}`,
+      )
+    }
+  })
+}
+
+// 105 — evidence is only what a tool returned: neither a refusal nor the review's own traffic is a line of code.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      {
+        toolCalls: [
+          toolCall('read_file', { path: '../../outside.txt' }),
+          toolCall('append_finding', { ...PROVEN, title: 'Quoting a refusal', evidence: 'refused: "../../outside.txt" is outside the workspace' }),
+        ],
+      },
+      { toolCalls: [toolCall('append_finding', { ...PROVEN, title: 'Echo', evidence: 'f1 [blocker] internal/chessx/board.go:13 — Quoting a refusal' })] },
+      record([], 'nothing proven'),
+    ],
+  })
+  const result = await h.invoke('')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 0, 'neither quote is evidence')
+  assert.equal(payload.withheld.length, 2)
+  for (const item of payload.withheld) {
+    assert.ok(item.reason.includes('does not occur'), item.reason)
+  }
+}
+
+// 106 — one policy bounds the model's context for both tool families, and the figure the run reports counts all of it, not the reader half.
+{
+  const findings = Array.from({ length: 100 }, (_, index) => ({ ...PROVEN, title: `Finding ${index + 1}` }))
+  const lists = Array.from({ length: 40 }, () => toolCall('list_findings', {}))
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: findings.map(finding => toolCall('append_finding', finding)) },
+      { toolCalls: lists },
+      { toolCalls: [toolCall('finish_review', {})] },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  const tool = messagesOf(h.seen.prompts[2], 'tool')
+  assert.equal(tool.length, 140, 'the hundred records and the forty listings each got a result')
+  const elided = tool.filter(message => message.content[0].text.startsWith('[elided:'))
+  assert.ok(elided.length > 0, 'the store traffic is elided like any other tool output')
+  assert.ok(
+    elided.some(message => message.content[0].text.includes('list_findings')),
+    `the listings the contract asks for are part of that policy: ${elided[0].content[0].text}`,
+  )
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 100)
+  assert.ok(
+    payload.stats.context.keptBytes > payload.stats.context.bytes,
+    'the kept figure counts the store output the reader budget never saw',
+  )
+}
+
+// 107 — the cap is a fact about the store, not a sentence the end-of-run bookkeeping compares: whatever stopped the run, the report says the store had already closed when that is why it is short.
+{
+  const lists = Array.from({ length: 301 }, () => toolCall('list_findings', {}))
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    abortAtCall: 3,
+    script: [
+      { toolCalls: [toolCall('append_finding', PROVEN), ...lists] },
+      { toolCalls: [toolCall('append_finding', { ...PROVEN, title: 'Too late' })] },
+      { text: 'never reached' },
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  const payload = payloadOf(result.text)
+  assert.equal(payload.findings.length, 1, 'the finding recorded before the cap survives the cancel too')
+  assert.equal(
+    payload.incomplete,
+    'the review was cancelled — the store had already taken its 300 finding-tool calls',
+    'a cancelled run still names the cap that had closed the store',
+  )
+  assert.equal(payload.stats.store.calls, 303)
+}
+
+// 108 — the finding structure is one table: the keys the model is offered, the store records and a refusal names are one set.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('append_finding', PROVEN)] },
+      { toolCalls: [toolCall('append_finding', { ...PROVEN, title: 'A key of my own', impactt: 'typo' })] },
+      record([], 'done'),
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  const append = h.seen.prompts[0].tools.find(tool => tool.name === 'append_finding')
+  const offered = Object.keys(append.parameters.properties)
+  const refusal = messagesOf(h.seen.prompts[2], 'tool')[1]
+  assert.equal(refusal.isError, true, 'the key outside the structure is refused')
+  const named = refusal.content[0].text.slice(refusal.content[0].text.indexOf('takes: ') + 'takes: '.length)
+  assert.deepEqual(named.split(', '), offered, 'and the refusal names exactly the keys the schema offered')
+  const [finding] = payloadOf(result.text).findings
+  assert.deepEqual(Object.keys(finding).filter(key => key !== 'id'), offered, 'every offered key is one the store records')
+}
+
+// 109 — read_file is the harness's read: the path and window the wrapper resolved are what reaches the tool, an ignored path never reaches it, and the file the report names is the workspace's own however the backend spells it.
+{
+  const script = [
+    {
+      toolCalls: [
+        toolCall('read_file', { path: READ_ONLY_FILE, offset: 3, limit: 2 }),
+        toolCall('read_file', { path: 'node_modules/dep/index.js' }),
+      ],
+    },
+    record([], 'windowed'),
+  ]
+  const h = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], script })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  assert.deepEqual(
+    h.tools.calls,
+    [{ name: 'read', arguments: { file_path: join(WS, 'internal', 'play', 'move.go'), offset: 3, limit: 2 } }],
+    'exactly one read reached the harness: the absolute path and the resolved window, and never the ignored one',
+  )
+  const tool = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(tool[0].isError, undefined, tool[0].content[0].text)
+  assert.ok(tool[0].content[0].text.includes(`[${READ_ONLY_FILE} — lines 3-4 of 5]`), tool[0].content[0].text)
+  assert.ok(tool[0].content[0].text.includes('func Apply(b *chessx.Board) {'), 'the window holds the lines asked for')
+  assert.ok(!tool[0].content[0].text.includes('package play'), 'and none before them')
+  assert.equal(tool[1].isError, true, 'an ignored path is refused without the harness being asked')
+  assert.ok(tool[1].content[0].text.includes("excluded by the review's ignore rules"), tool[1].content[0].text)
+  assert.deepEqual(
+    payloadOf(result.text).stats.context.files,
+    [READ_ONLY_FILE],
+    'an absolute value.path is not what the report names the file',
+  )
+
+  const relative = harness({ summary: SUMMARY, diffs: [TEXT_DIFF, BINARY_DIFF], readPath: 'relative', script })
+  await relative.invoke('')
+  assert.ok(
+    messagesOf(relative.seen.prompts[1], 'tool')[0].content[0].text.includes(`[${READ_ONLY_FILE} — lines 3-4 of 5]`),
+    'and a backend that reports a relative path is believed as it stands',
+  )
+}
+
+// 110 — search is the harness's grep: the query arrives as the escaped literal ripgrep needs, at the workspace root, and the rows are the review's own "path:line: text".
+{
+  writeFileSync(join(WS, 'internal', 'chessx', 'marks.txt'), [
+    'var size = board.squares',
+    'var sizeTypo = boardXsquares',
+    '',
+  ].join('\n'))
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('search', { query: 'board.squares' })] },
+      record([], 'searched'),
+    ],
+  })
+  await h.invoke('')
+  assert.deepEqual(
+    h.tools.calls,
+    [{ name: 'grep', arguments: { pattern: 'board\\.squares', path: WS } }],
+    'the escaped literal, not the query, is what the regular-expression tool is asked for',
+  )
+  const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+  assert.ok(tool.content[0].text.includes('[1 match(es) for "board.squares"]'), tool.content[0].text)
+  assert.ok(
+    tool.content[0].text.includes('internal/chessx/marks.txt:1: var size = board.squares'),
+    'a row is path:line: text',
+  )
+  assert.ok(!tool.content[0].text.includes('boardXsquares'), 'and a dot the query meant literally matched no other character')
+}
+
+// 111 — the ignore rules gate what comes back too: a match the harness returned from an ignored path is dropped by the wrapper, and cannot become a finding.
+{
+  mkdirSync(join(WS, 'node_modules', 'dep'), { recursive: true })
+  writeFileSync(join(WS, 'node_modules', 'dep', 'hidden.js'), 'module.exports = "SHARED_NEEDLE"\n')
+  writeFileSync(join(WS, 'internal', 'play', 'visible.go'), 'var Visible = "SHARED_NEEDLE"\n')
+  const found = await fakeToolService(WS).execute({
+    name: 'grep',
+    arguments: { pattern: 'SHARED_NEEDLE', path: WS },
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(
+    found.value.matches.map(match => match.path).sort(),
+    ['internal/play/visible.go', 'node_modules/dep/hidden.js'],
+    'the harness really did return both matches, the ignored one included',
+  )
+
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      { toolCalls: [toolCall('search', { query: 'SHARED_NEEDLE' })] },
+      record([{
+        severity: 'major', category: 'correctness', file: 'node_modules/dep/hidden.js', line: 1,
+        title: 'A dependency nobody asked about', problem: 'a claim built on a path the review excluded',
+        impact: 'The reviewer reports on code that was never part of the review.',
+        trigger: 'A search hit under an ignored path reaches this.',
+        suggestion: 'none', evidence: 'module.exports = "SHARED_NEEDLE"',
+      }], 'searched'),
+    ],
+  })
+  const result = await h.invoke('')
+  const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+  assert.ok(tool.content[0].text.includes('[1 match(es) for "SHARED_NEEDLE"]'), tool.content[0].text)
+  assert.ok(tool.content[0].text.includes('internal/play/visible.go:1: var Visible = "SHARED_NEEDLE"'), tool.content[0].text)
+  assert.ok(!tool.content[0].text.includes('node_modules'), 'the ignored row never becomes context')
+  const payload = payloadOf(result.text)
+  assert.deepEqual(payload.stats.context.files, ['internal/play/visible.go'], 'nor part of the evidence corpus')
+  assert.equal(payload.findings.length, 0)
+  assert.equal(payload.withheld.length, 1)
+  assert.ok(payload.withheld[0].reason.includes('not one the reviewer could see'), payload.withheld[0].reason)
+}
+
+// 112 — a harness that exposes neither read nor grep still offers the plugin's own list_dir, and each missing capability costs exactly the tool that needs it.
+{
+  const { value, warnings } = await captureWarnings(async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      toolService: false,
+      script: [
+        {
+          toolCalls: [
+            toolCall('read_file', { path: READ_ONLY_FILE }),
+            toolCall('search', { query: 'MARKER' }),
+            toolCall('list_dir', { path: 'internal' }),
+          ],
+        },
+        record([PROVEN], 'diff and a listing'),
+      ],
+    })
+    return { h, result: await h.invoke('') }
+  })
+  const h = value.h
+  assert.equal(value.result.kind, 'success', value.result.text)
+  const request = h.seen.prompts[0]
+  assert.deepEqual(
+    request.tools.map(tool => tool.name),
+    [...REVIEW_TOOL_NAMES, 'list_dir'],
+    'the review tools, plus the one reader tool that needs no harness tool',
+  )
+  assert.equal(assertOneReading(request, 'no tool service at all'), true, 'and the contract claims exactly that one')
+  assert.ok(request.system.includes('You have one read-only tool: list_dir.'), 'naming it, and it alone')
+  assert.ok(!request.system.includes('This run cannot read the project'), 'so the run is not told it cannot read')
+  const refused = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(refused.length, 3, 'every call still gets exactly one result')
+  assert.deepEqual(refused.slice(0, 2).map(message => message.isError), [true, true], 'the two tools that need the harness are refused')
+  assert.ok(refused[0].content[0].text.includes('this harness exposes no "read" tool'), refused[0].content[0].text)
+  assert.ok(refused[1].content[0].text.includes('this harness exposes no "grep" tool'), refused[1].content[0].text)
+  assert.ok(refused[1].content[0].text.includes('list_dir'), 'and a refusal names the reader tools this run does still offer')
+  assert.equal(refused[2].isError, undefined, 'while list_dir runs on the plugin itself')
+  assert.ok(refused[2].content[0].text.includes('dir  chessx'), refused[2].content[0].text)
+  assert.equal(h.tools.calls.length, 0, 'no tool the harness does not have was ever consulted')
+  assert.equal(payloadOf(value.result.text).stats.context.calls, 1, 'only the listing is a reader call')
+  assert.equal(payloadOf(value.result.text).findings.length, 1, 'a finding grounded in the diff alone still publishes')
+  assert.deepEqual(
+    warnings.filter(line => line.includes('will not be offered')),
+    [
+      '[code-review] this harness exposes no "read" tool to the run; read_file will not be offered',
+      '[code-review] this harness exposes no "grep" tool to the run; search will not be offered',
+    ],
+    `each missing capability is reported once, and list_dir is never one of them: ${warnings.join(' | ')}`,
+  )
+
+  const half = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    toolNames: ['read'],
+    script: [
+      { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE }), toolCall('search', { query: 'MARKER' })] },
+      record([], 'half a service'),
+    ],
+  })
+  const partial = await half.invoke('')
+  assert.equal(partial.kind, 'success', partial.text)
+  const halfRequest = half.seen.prompts[0]
+  assert.deepEqual(
+    halfRequest.tools.map(tool => tool.name),
+    [...REVIEW_TOOL_NAMES, 'read_file', 'list_dir'],
+    'a harness with only read keeps read_file and list_dir, and drops search',
+  )
+  // The count is written as a numeral from two on, so the word is accepted too: what the test pins is the sentence and the tools it names.
+  assert.ok(/You have (?:two|2) read-only tools: read_file and list_dir\./.test(halfRequest.system), halfRequest.system.slice(halfRequest.system.indexOf('## Reading')))
+  assert.equal(assertOneReading(halfRequest, 'a service exposing only read'), true)
+  const halfRefused = messagesOf(half.seen.prompts[1], 'tool')
+  assert.equal(halfRefused[0].isError, undefined, halfRefused[0].content[0].text)
+  assert.ok(halfRefused[0].content[0].text.includes('MARKER_NIL_SQUARES'), 'the read ran on the harness tool it has')
+  assert.equal(halfRefused[1].isError, true, 'and the search is refused for the capability it lacks')
+  assert.ok(halfRefused[1].content[0].text.includes('this harness exposes no "grep" tool'), halfRefused[1].content[0].text)
+  assert.ok(halfRefused[1].content[0].text.includes('read_file'), 'the refusal names the reader tools this run still offers')
+  assert.deepEqual(half.tools.calls.map(call => call.name), ['read'], 'only the tool the harness has was consulted')
+}
+
+// 113 — the harness's own refusals and failures are the reader's refusal reasons: a directory, a binary, a missing file and a broken tool are refused reads, never the end of the review.
+{
+  writeFileSync(join(WS, 'internal', 'chessx', 'logo.bin'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03]))
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    script: [
+      {
+        toolCalls: [
+          toolCall('read_file', { path: 'internal' }),
+          toolCall('read_file', { path: 'internal/chessx/logo.bin' }),
+          toolCall('read_file', { path: 'internal/chessx/gone.go' }),
+        ],
+      },
+      record([], 'nothing readable'),
+    ],
+  })
+  const result = await h.invoke('')
+  const tool = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(h.tools.calls.length, 6, 'each refusal is the harness\'s, observed twice: once for the window and once for its own default')
+  assert.deepEqual(
+    h.tools.calls.map(call => Object.hasOwn(call.arguments, 'limit')),
+    [true, false, true, false, true, false],
+    'the retry drops the limit the deployment refused, and nothing else',
+  )
+  for (const [index, reason] of ['not a regular file', 'binary file', 'not found'].entries()) {
+    assert.equal(tool[index].isError, true, tool[index].content[0].text)
+    assert.ok(tool[index].content[0].text.startsWith('cannot read '), tool[index].content[0].text)
+    assert.ok(tool[index].content[0].text.includes(reason), tool[index].content[0].text)
+  }
+  assert.equal(payloadOf(result.text).stats.context.calls, 3, 'two harness calls are one refused read, and a refused read is still a call against the budget')
+
+  const broken = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    readFails: 'the file store is offline',
+    grepFails: { throws: 'the search backend is unreachable' },
+    script: [
+      { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] },
+      { toolCalls: [toolCall('search', { query: 'MARKER_NIL_SQUARES' })] },
+      record([{ ...PROVEN, file: READ_ONLY_FILE, evidence: READ_ONLY_LINE }], 'nothing was read'),
+    ],
+  })
+  const brokenResult = await broken.invoke('')
+  assert.equal(brokenResult.kind, 'success', brokenResult.text)
+  const brokenTool = messagesOf(broken.seen.prompts[2], 'tool')
+  assert.ok(
+    brokenTool[0].content[0].text.includes(`cannot read ${READ_ONLY_FILE}: Error: the file store is offline`),
+    brokenTool[0].content[0].text,
+  )
+  assert.ok(
+    brokenTool[1].content[0].text.includes('search failed: Error: the search backend is unreachable'),
+    brokenTool[1].content[0].text,
+  )
+  assert.deepEqual(
+    brokenTool.map(message => message.isError),
+    [true, true],
+    'a tool that answers with a failure and a tool that throws are both refused calls',
+  )
+  const brokenPayload = payloadOf(brokenResult.text)
+  assert.equal(brokenPayload.findings.length, 0, 'what no tool returned is not evidence')
+  assert.equal(brokenPayload.withheld.length, 1)
+  assert.ok(brokenPayload.withheld[0].reason.includes('not one the reviewer could see'), brokenPayload.withheld[0].reason)
+}
+
+// 114 — a cancel landing while a read is running stops the run, instead of being reported as a tool that failed.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    abortOnTool: true,
+    script: [{ toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] }, record([], 'never reached')],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'error', result.text)
+  assert.ok(result.text.includes('cancelled'), result.text)
+  assert.equal(h.tools.calls.length, 1, 'the call had already reached the harness when the cancel landed')
+  assert.equal(h.seen.prompts.length, 1, 'and the run stopped there')
+}
+
+// 115 — a harness that exposes only grep keeps search and list_dir, and a read_file call is refused by the capability it lacks, not by the family.
+{
+  const { value, warnings } = await captureWarnings(async () => {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      toolNames: ['grep'],
+      script: [
+        {
+          toolCalls: [
+            toolCall('read_file', { path: READ_ONLY_FILE }),
+            toolCall('search', { query: 'MARKER_NIL_SQUARES' }),
+            toolCall('list_dir', { path: 'internal' }),
+          ],
+        },
+        record([], 'half a service'),
+      ],
+    })
+    return { h, result: await h.invoke('') }
+  })
+  const h = value.h
+  assert.equal(value.result.kind, 'success', value.result.text)
+  const request = h.seen.prompts[0]
+  assert.deepEqual(
+    request.tools.map(tool => tool.name),
+    [...REVIEW_TOOL_NAMES, 'list_dir', 'search'],
+    'the tools this deployment can run, in the order the plugin declares them',
+  )
+  assert.ok(/You have (?:two|2) read-only tools: list_dir and search\./.test(request.system), 'and the contract names exactly those two')
+  assert.equal(assertOneReading(request, 'a service exposing only grep'), true)
+  const tool = messagesOf(h.seen.prompts[1], 'tool')
+  assert.equal(tool.length, 3, 'every call of the turn got exactly one result')
+  assert.equal(tool[0].isError, true, 'the read is refused')
+  assert.ok(tool[0].content[0].text.includes('this harness exposes no "read" tool'), tool[0].content[0].text)
+  assert.ok(
+    tool[0].content[0].text.includes('list_dir') && tool[0].content[0].text.includes('search'),
+    'and the refusal names the reader tools this run does offer',
+  )
+  assert.equal(tool[1].isError, undefined, tool[1].content[0].text)
+  assert.ok(tool[1].content[0].text.includes('[1 match(es) for "MARKER_NIL_SQUARES"]'), 'search ran on the harness grep')
+  assert.equal(tool[2].isError, undefined)
+  assert.ok(tool[2].content[0].text.includes('dir  chessx'), 'and list_dir needs no harness tool at all')
+  assert.deepEqual(h.tools.calls.map(call => call.name), ['grep'], 'only the tool this deployment has was consulted')
+  assert.equal(payloadOf(value.result.text).stats.context.calls, 2, 'a refused read is not a call')
+  assert.deepEqual(
+    warnings.filter(line => line.includes('will not be offered')),
+    ['[code-review] this harness exposes no "read" tool to the run; read_file will not be offered'],
+    `the one capability this harness lacks is the one reported: ${warnings.join(' | ')}`,
+  )
+}
+
+// 116 — a deployment whose read window is capped below the review's 400 is answered by the retry: two harness calls, the second without a limit, and the read lands.
+{
+  const h = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    readLimit: 200,
+    script: [
+      { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] },
+      record([{ ...PROVEN, file: READ_ONLY_FILE, line: 4, evidence: READ_ONLY_LINE }], 'read it'),
+    ],
+  })
+  const result = await h.invoke('')
+  assert.equal(result.kind, 'success', result.text)
+  assert.deepEqual(
+    h.tools.calls.map(call => call.arguments),
+    [
+      { file_path: join(WS, 'internal', 'play', 'move.go'), offset: 1, limit: 400 },
+      { file_path: join(WS, 'internal', 'play', 'move.go'), offset: 1 },
+    ],
+    'the capped window is asked for once, and the retry asks for no window at all',
+  )
+  const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+  assert.equal(tool.isError, undefined, tool.content[0].text)
+  assert.ok(tool.content[0].text.includes(`[${READ_ONLY_FILE} — lines 1-5 of 5]`), tool.content[0].text)
+  assert.ok(tool.content[0].text.includes('MARKER_NIL_SQUARES'), 'the retried read returned the file')
+  const payload = payloadOf(result.text)
+  assert.equal(payload.stats.context.calls, 1, 'two harness calls are still one reader call')
+  assert.equal(payload.findings.length, 1, 'and the finding the read grounds is published')
+
+  const within = harness({
+    summary: SUMMARY,
+    diffs: [TEXT_DIFF, BINARY_DIFF],
+    readLimit: 200,
+    script: [
+      { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE, offset: 3, limit: 2 })] },
+      record([], 'windowed'),
+    ],
+  })
+  await within.invoke('')
+  assert.deepEqual(
+    within.tools.calls.map(call => call.arguments),
+    [{ file_path: join(WS, 'internal', 'play', 'move.go'), offset: 3, limit: 2 }],
+    'a window the deployment accepts is never retried',
+  )
+  assert.equal(messagesOf(within.seen.prompts[1], 'tool')[0].isError, undefined)
+}
+
+// 117 — a read that succeeds with a value the wrapper does not declare is refused, never reported as an empty file.
+{
+  for (const [readMalformed, what] of [[true, 'the lines are not a list'], ['text', 'a line carries no text'], ['totalLines', 'the total is not a whole number']]) {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      readMalformed,
+      script: [
+        { toolCalls: [toolCall('read_file', { path: READ_ONLY_FILE })] },
+        record([{ ...PROVEN, file: READ_ONLY_FILE, line: 4, evidence: READ_ONLY_LINE }], 'read it'),
+      ],
+    })
+    const result = await h.invoke('')
+    assert.equal(result.kind, 'success', result.text)
+    const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+    assert.equal(tool.isError, true, `${what}: ${tool.content[0].text}`)
+    assert.ok(
+      tool.content[0].text.startsWith(`cannot read ${READ_ONLY_FILE}: the harness's read returned an unexpected shape`),
+      `${what}: ${tool.content[0].text}`,
+    )
+    assert.ok(!tool.content[0].text.includes('lines 1-'), `${what}: no window is claimed for a file the run never saw`)
+    assert.equal(h.tools.calls.length, 1, `${what}: a malformed success is not a window refusal, so it is not retried`)
+    const payload = payloadOf(result.text)
+    assert.equal(payload.findings.length, 0, `${what}: nothing is evidenced by a result the wrapper cannot read`)
+    assert.equal(payload.withheld.length, 1)
+    assert.ok(
+      payload.withheld[0].reason.includes('not one the reviewer could see'),
+      `${what}: reading it as an empty file would have made the file visible — ${payload.withheld[0].reason}`,
+    )
+    assert.deepEqual(payload.stats.context.files, [], `${what}: and the file never entered the run's corpus`)
+  }
+}
+
+// 118 — a search that succeeds with a value the wrapper does not declare is a refusal, never "no match": the project was not searched to a conclusion.
+{
+  for (const [grepMalformed, what] of [[true, 'the matches are not a list'], ['row', 'a row carries no line number']]) {
+    const h = harness({
+      summary: SUMMARY,
+      diffs: [TEXT_DIFF, BINARY_DIFF],
+      grepMalformed,
+      script: [
+        { toolCalls: [toolCall('search', { query: 'MARKER_NIL_SQUARES' })] },
+        record([], 'searched'),
+      ],
+    })
+    const result = await h.invoke('')
+    assert.equal(result.kind, 'success', result.text)
+    const tool = messagesOf(h.seen.prompts[1], 'tool')[0]
+    assert.equal(tool.isError, true, `${what}: ${tool.content[0].text}`)
+    assert.ok(
+      tool.content[0].text.startsWith("search failed: the harness's grep returned an unexpected shape"),
+      `${what}: ${tool.content[0].text}`,
+    )
+    assert.ok(!tool.content[0].text.includes('no match'), `${what}: an unreadable result is not a claim that the project holds nothing`)
+    assert.equal(h.tools.calls.length, 1, `${what}: the harness was asked exactly once`)
+    assert.equal(payloadOf(result.text).stats.context.calls, 1, `${what}: the refused search is still a call against the budget`)
+  }
+}
+
+// 119 — a review asked for on a session that has not started a turn is drawn where that session can see it.
+{
+  const report = {
+    verdict: 'warn',
+    summary: 'The change set is sound but the retry path is thin.',
+    findings: [{
+      severity: 'major', title: 'Retry drops the reader budget', file: 'a.go', line: 12,
+      problem: 'p', impact: 'i', trigger: 'tr', suggestion: 's', evidence: '+x',
+    }],
+    withheld: [],
+    stats: { files: 2, added: 9, deleted: 3, reviewed: 2, skipped: [] },
+    reviewer: { provider: 'deepseek-official', model: 'deepseek-flash' },
+  }
+  const text = `## Code review — WARN\n\nA summary.\n\n${MARKER}\n\`\`\`json\n${JSON.stringify(report)}\n\`\`\`\n`
+  const nodes = [{
+    kind: 'command', seq: 5, commandId: 'cmd-1', name: 'review', args: ' full',
+    outcome: { kind: 'success', text },
+  }]
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+
+  const dock = await renderDock({ nodes, session: blank })
+  assert.ok(dock.texts.includes('Code review'), `the dock draws the report card: ${JSON.stringify(dock.texts)}`)
+  assert.ok(dock.texts.includes('warn'), 'chipped with the verdict the host sent')
+  assert.ok(dock.texts.includes('The change set is sound but the retry path is thin.'), 'opened by the summary the reviewer recorded')
+  assert.ok(dock.texts.includes('Retry drops the reader budget'), 'with the finding the report recorded')
+  assert.ok(dock.texts.includes('a.go:12'), 'and where it is')
+  assert.deepEqual(
+    dock.buttons,
+    ['action.copyReport', 'toggle.hide', 'action.copyFinding'],
+    'the same controls the transcript row offers, and nothing more',
+  )
+
+  const row = await renderCard({ kind: 'success', text })
+  assert.deepEqual(row.buttons, dock.buttons, 'both seats draw one card, not two dialects of it')
+  assert.ok(row.texts.includes('Retry drops the reader budget'), 'and the transcript row still draws it as before')
+}
+
+// 120 — the dock yields the moment the shell draws the transcript, and stays quiet without a review to stand for.
+{
+  const text = `## Code review — PASS\n\nNothing proven.\n\n${MARKER}\n\`\`\`json\n{"verdict":"pass","findings":[],"stats":{}}\n\`\`\`\n`
+  const nodes = [{
+    kind: 'command', seq: 5, commandId: 'cmd-1', name: 'review', args: '',
+    outcome: { kind: 'success', text },
+  }]
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+  const cases = [
+    ['the session has started', { session: { ...blank, blank: false }, activeTargets: 0 }],
+    ['a turn is running', { session: { ...blank, running: true }, activeTargets: 0 }],
+    ['a prompt was attempted', { session: { ...blank, promptAttempted: true }, activeTargets: 0 }],
+    ['a conversation target reports activity', { session: blank, activeTargets: 1 }],
+  ]
+  for (const [what, shape] of cases) {
+    const dock = await renderDock({ nodes, ...shape })
+    assert.deepEqual(dock.texts, [], `${what}: the dock draws nothing`)
+    assert.deepEqual(dock.buttons, [], `${what}: and offers nothing`)
+  }
+
+  const otherCommand = await renderDock({
+    nodes: [{ kind: 'command', seq: 7, commandId: 'cmd-9', name: 'plan', args: ' on', outcome: { kind: 'success', text: 'Plan mode on.' } }],
+    session: blank,
+  })
+  assert.deepEqual(otherCommand.texts, [], "a session whose newest command is not /review has no report to stand for")
+}
+
+// 121 — the dock reports the run itself, not only its end.
+{
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+  const running = await renderDock({
+    nodes: [{ kind: 'command', seq: 3, commandId: 'cmd-2', name: 'review', args: ' full', outcome: null }],
+    session: blank,
+  })
+  assert.ok(running.texts.includes('state.running'), 'a review in flight says so above the composer')
+  assert.deepEqual(running.buttons, [], 'and offers nothing to press while it runs')
+
+  const failed = await renderDock({
+    nodes: [{
+      kind: 'command', seq: 4, commandId: 'cmd-3', name: 'review', args: '',
+      outcome: { kind: 'error', text: 'code-review: the reviewer call failed — boom' },
+    }],
+    session: blank,
+  })
+  assert.ok(failed.texts.includes('state.error'), 'a failed review is reported as one, not hidden with the logs')
+  assert.ok(failed.texts.includes('code-review: the reviewer call failed — boom'), 'with its reason readable')
+  assert.deepEqual(failed.buttons, ['action.copyReport'], 'with the raw text copyable')
+}
+
+// 122 — the dock stands in for the newest review, whatever it settled as.
+{
+  const first = `## Code review — WARN\n\nFIRST_REPORT.\n\n${MARKER}\n\`\`\`json\n{"verdict":"warn","findings":[],"stats":{}}\n\`\`\`\n`
+  const nodes = [
+    { kind: 'command', seq: 5, commandId: 'cmd-1', name: 'review', args: '', outcome: { kind: 'success', text: first } },
+    { kind: 'command', seq: 8, commandId: 'cmd-2', name: 'plan', args: ' on', outcome: { kind: 'success', text: 'Plan mode on.' } },
+    { kind: 'command', seq: 9, commandId: 'cmd-3', name: 'review', args: ' mode=arc', outcome: { kind: 'error', text: 'code-review: unknown mode' } },
+  ]
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+  const dock = await renderDock({ nodes, session: blank })
+  assert.ok(dock.texts.includes('state.error'), 'the newest review is the one that settled last')
+  assert.ok(dock.texts.includes('code-review: unknown mode'), 'and its own text is what is shown')
+  assert.ok(!dock.texts.includes('Code review'), 'not the older report it replaced')
+}
+
+// 123 — the dock's gate is the shell's own blank-session gate, mirrored in one place.
+{
+  const { api } = await loadClientSurface()
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+  assert.equal(api.__test.transcriptHidden(blank, 0), true, 'a fresh session draws no transcript')
+  assert.equal(api.__test.transcriptHidden({ ...blank, running: true }, 0), false, 'a running turn brings the transcript')
+  assert.equal(api.__test.transcriptHidden({ ...blank, promptAttempted: true }, 0), false, 'an attempted prompt brings it too')
+  assert.equal(api.__test.transcriptHidden(blank, 1), false, 'a conversation target with activity brings it')
+  assert.equal(api.__test.transcriptHidden({ ...blank, blank: false }, 0), false, 'a started conversation is not blank')
+  assert.equal(api.__test.transcriptHidden(undefined, 0), false, 'an absent Session has no dock to fill')
 }
 
 console.log('selftest: all checks passed')
