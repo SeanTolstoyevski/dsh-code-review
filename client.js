@@ -12,6 +12,9 @@ window.__ModuleLoader__.load({
     const NS = 'code-review'
     const MARKER = '<!-- code-review:payload -->'
 
+    /** Shared empty node list: a selector must return a stable identity while nothing changed. */
+    const NO_NODES = []
+
     /** What the card draws when a payload does not describe its mode — a truncated payload, or the raw fallback face — so a finding is never blank. */
     const DEFAULT_MODE = {
       id: 'cr',
@@ -101,6 +104,25 @@ window.__ModuleLoader__.load({
   border-radius: 10px; padding: 10px 12px; margin: 4px 0;
   font-size: 12.5px; line-height: 1.55; color: var(--dsw-alias-label-primary);
 }
+/* The composer-stack occurrence: the same card, measured and capped like the harness's own dock cards
+   (ui-goal GoalBar.module.css; the composer seat's own --dsh-composer-text-max-height), so a long report
+   scrolls inside the card instead of pushing the hero composer out of reach. */
+.dcr-dock {
+  box-sizing: border-box;
+  width: calc(
+    100% -
+    var(--dsh-composer-side-clearance, 16px) -
+    var(--dsh-composer-side-clearance, 16px) -
+    var(--dsh-composer-dock-inset, 8px) -
+    var(--dsh-composer-dock-inset, 8px) -
+    var(--dsh-composer-dock-inset, 8px) -
+    var(--dsh-composer-dock-inset, 8px)
+  );
+  max-width: calc(var(--dsh-composer-card-max-width, 952px) - 4 * var(--dsh-composer-dock-inset, 8px));
+  margin: 0 auto;
+}
+.dcr-card-dock { margin: 0; }
+.dcr-card-dock .dcr-body { max-height: var(--dsh-composer-text-max-height, 336px); overflow-y: auto; }
 .dcr-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .dcr-title { font-weight: 600; }
 .dcr-spacer { flex: 1 1 auto; }
@@ -175,6 +197,33 @@ window.__ModuleLoader__.load({
       return payload === undefined
         ? { face: 'unparsed', payload: undefined }
         : { face: 'report', payload }
+    }
+
+    /** Whether the shell draws no transcript for this Session at all, which is the one case the dock card exists for.
+     * This is the shell's own gate, not a guess: `conversationPhase` (ui-conversation contract/snapshot.ts) calls a
+     * Session active when a Conversation target contributes visible activity, a Turn runs, or the conversation has
+     * started, and `DefaultConversationViews` then renders nothing while `session.blank && phase === 'blank'`.
+     * A Chat whose only rows are commands is deliberately NOT activity (chat-snapshot-builder.ts `isActive`), and a
+     * command lifecycle never opens a Turn — so a report asked for on a fresh session has nowhere to land today.
+     * With `blank === true` the phase reduces to "no active target, no running Turn, no attempted prompt". */
+    function transcriptHidden(session, activeTargetCount) {
+      if (session?.blank !== true) return false
+      if (session.running === true) return false
+      if (session.promptAttempted === true) return false
+      if (activeTargetCount > 0) return false
+      return true
+    }
+
+    /** The newest folded `/review` lifecycle in the Chat snapshot, or undefined when this session never ran one —
+     * the same CommandNode the transcript row hands the card, read from the one place a client sees it (`legacy.nodes`,
+     * the finalized node stream). An error settles here too: a failed review is the answer the reader asked for. */
+    function latestReviewCommand(nodes) {
+      if (!Array.isArray(nodes)) return undefined
+      for (let index = nodes.length - 1; index >= 0; index -= 1) {
+        const node = nodes[index]
+        if (node?.kind === 'command' && node.name === 'review') return node
+      }
+      return undefined
     }
 
     function reportOf(text) {
@@ -406,18 +455,20 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    function ReviewCard({ node, t }) {
+    function ReviewCard({ node, t, dock = false }) {
       const outcome = node?.outcome ?? null
       const [open, setOpen] = React.useState(true)
       const view = React.useMemo(() => readOutcome(outcome), [outcome])
       const { face, payload } = view
+      // One card, two seats: the transcript row draws it as it always has, the composer dock caps its body.
+      const cardClass = dock ? 'dcr-card dcr-card-dock' : 'dcr-card'
 
       const toggle = h('button', {
         className: 'dcr-toggle', type: 'button', onClick: () => setOpen(value => !value),
       }, t(open ? 'toggle.hide' : 'toggle.show'))
 
       if (face === 'running') {
-        return h('div', { className: 'dcr-card' }, [
+        return h('div', { className: cardClass }, [
           h('style', { key: 'css' }, CSS),
           head(t('title'), [chip(t('state.running'), 'muted', 'run')], null),
         ])
@@ -425,7 +476,7 @@ window.__ModuleLoader__.load({
 
       if (face === 'error' || face === 'unparsed') {
         const raw = String(outcome.text ?? '')
-        return h('div', { className: 'dcr-card' }, [
+        return h('div', { className: cardClass }, [
           h('style', { key: 'css' }, CSS),
           head(
             t('title'),
@@ -454,7 +505,7 @@ window.__ModuleLoader__.load({
         ? payload.incomplete
         : undefined
 
-      return h('div', { className: 'dcr-card' }, [
+      return h('div', { className: cardClass }, [
         h('style', { key: 'css' }, CSS),
         head(
           mode.label,
@@ -471,7 +522,7 @@ window.__ModuleLoader__.load({
         incomplete === undefined
           ? null
           : h('div', { className: 'dcr-meta', key: 'incomplete' }, `${t('label.incomplete')}: ${incomplete}`),
-        open ? h('div', { key: 'body' }, [
+        open ? h('div', { className: 'dcr-body', key: 'body' }, [
           payload.summary
             ? h('div', { className: 'dcr-summary', key: 'summary' }, payload.summary)
             : null,
@@ -488,10 +539,28 @@ window.__ModuleLoader__.load({
       ])
     }
 
+    /** The composer-stack occurrence: the same card, drawn only while the shell draws no transcript for this
+     * Session. Hooks run first and on every render; the two decisions after them are pure. */
+    function ReviewDock({ session, useChat, useConversation, t }) {
+      const nodes = useChat(value => value?.legacy?.nodes ?? NO_NODES)
+      const activity = useConversation(value => value?.activeTargets?.size ?? 0)
+      if (!transcriptHidden(session, activity)) return null
+      const node = latestReviewCommand(nodes)
+      if (node === undefined) return null
+      return h('div', { className: 'dcr-dock' }, h(ReviewCard, { node, t, dock: true }))
+    }
+
+    /** Seat adapter. A shell that composes no Chat standard source has nothing to stand in for, and this
+     * component calls no hook itself, so a late source mounts ReviewDock rather than changing its hook count. */
+    function Dock(props) {
+      if (typeof props.useChat !== 'function' || typeof props.useConversation !== 'function') return null
+      return h(ReviewDock, props)
+    }
+
     return {
       inject: ['slots', 'locale'],
       /** Loaded by the self-test, which imports this artifact with a stub React. */
-      __test: { parsePayload, readOutcome, reportOf, findingText, modeOf, severityOf },
+      __test: { parsePayload, readOutcome, reportOf, findingText, modeOf, severityOf, transcriptHidden },
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, 'en', en), 'code-review: en dictionary')
         ctx.effect(() => ctx.locale.register(NS, 'zh', zh), 'code-review: zh dictionary')
@@ -503,6 +572,15 @@ window.__ModuleLoader__.load({
           key: 'review',
           locale: NS,
         }, Card))
+        // The second seat: a report asked for on a Session whose first Turn has not started has no transcript
+        // row to land on, so the same card stands in above the composer until the conversation does.
+        const DockSeat = props => h(Dock, { ...props, t })
+        ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+          name: 'conversation.input.dock',
+          id: 'code-review',
+          order: 30,
+          locale: NS,
+        }, DockSeat))
       },
     }
   },

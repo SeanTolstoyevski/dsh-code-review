@@ -70,6 +70,12 @@ and the quote is checked against the diff and the files the reviewer actually re
 — a claim that does not hold up is listed as *withheld* with its reason instead of
 being published. The card shows and copies; it has no control that sends anything.
 
+On a session whose first message has not been sent yet, the harness draws no
+transcript at all — and `/review` never starts a turn — so the card waits above the
+composer instead, saying that the review is running, then handing over the report.
+It moves into the transcript the moment the conversation starts, and it reads the
+newest `/review` of that session, error or report alike.
+
 ## Documentation
 
 | Document | Covers |

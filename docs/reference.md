@@ -335,6 +335,26 @@ The card shows and copies; it has no control that sends anything: a review is a
 decision aid, not a work order and the decision — with the instruction that
 follows from it — is yours to give.
 
+### Where the card lands
+
+The card is drawn in two places, never twice at once:
+
+- **The conversation.** The `/review` row of the transcript, where every resolved
+  command gets its line — the report you read back later, and the one a modified
+  session still carries.
+- **Above the composer.** On a session that has not started its first turn, the
+  harness draws no transcript at all (a blank session shows its hero), so the card
+  stands in there instead: the running face while the reviewer works, then the
+  report. It yields to the transcript the moment the conversation starts.
+
+That second seat is not a preference, it is what the blank state leaves. A command
+lifecycle never opens a turn — as far as the shell is concerned the session has not
+started, and its transcript rows are not rendered at all. The dock card therefore
+reads the newest `/review` of that session, error or report alike: a failed review
+is an answer, and it is the one that has to be visible. It is capped in height (the
+composer seat's own cap) and scrolls inside itself, so a long report never pushes
+the composer out of reach.
+
 ## Limits
 
 - One run is bounded by the reader budgets, by `timeoutMs`, and by the plugin's
@@ -351,6 +371,9 @@ follows from it — is yours to give.
   instead of showing an empty pass.
 - The store lives in the Host process, so a restart loses the run in progress —
   what survives is every run that finished, in the card.
+- The dock card is drawn only while the shell draws no transcript for that session:
+  once the first turn starts, the report is read in the transcript instead. It stands
+  for the newest `/review` of that session, so an older report is read back there.
 - The reviewer reads the workspace but cannot run anything, so build and test
   results stay outside its reach by construction.
 - Files changed by a shell command cannot be attributed to the session; they show

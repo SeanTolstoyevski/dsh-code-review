@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-code-review",
-  "version": "2.0.0",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
-  "description": "On-demand review for DeepSeek Harness: audits the uncommitted changes in a workspace in one of its modes (code review, architecture review, or a mode the user writes) and renders the report as a card in the conversation, for the human who asked for it.",
+  "description": "On-demand review for DeepSeek Harness: audits the uncommitted changes in a workspace in one of its modes (code review, architecture review, or a mode the user writes) and renders the report as a card in the conversation — or, until the session's first turn starts and the harness draws a transcript at all, above the composer — for the human who asked for it.",
   "license": "MIT",
   "icon": "./icon.svg",
   "exports": {
