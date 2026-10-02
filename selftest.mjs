@@ -1379,19 +1379,30 @@ async function loadClientModule() {
   return clientModule
 }
 
-async function renderCard(outcome) {
+/** Apply the client half once with recording stubs, capturing every seat the artifact registers. */
+async function loadClientSurface() {
   const api = (await loadClientModule()).factory(() => recordingReact())
-  let Card
+  const registrations = []
   api.apply({
     effect: callback => callback(),
     locale: { register: () => () => {}, bind: () => key => key },
     slots: {
       inject: (_slot, callback) => callback(),
-      register: (_options, component) => { Card = component; return () => {} },
+      register: (options, component) => { registrations.push({ options, component }); return () => {} },
     },
   })
-  assert.equal(typeof Card, 'function', 'the card is registered on the command view')
+  return { api, registrations }
+}
 
+/** The single component the artifact seats in one named slot. */
+function componentOn(registrations, name) {
+  const seated = registrations.filter(entry => entry.options.name === name)
+  assert.equal(seated.length, 1, `the client half seats exactly one component on ${name}`)
+  return seated[0].component
+}
+
+/** Render one client component and collect the short strings and button captions it draws. */
+function drawComponent(component, props) {
   const seen = { texts: [], buttons: [] }
   const visit = node => {
     if (typeof node === 'string') {
@@ -1407,8 +1418,28 @@ async function renderCard(outcome) {
     }
     visit(node.props.children)
   }
-  visit(Card({ node: { outcome }, t: key => key }))
+  visit(component(props))
   return seen
+}
+
+async function renderCard(outcome) {
+  const { registrations } = await loadClientSurface()
+  return drawComponent(componentOn(registrations, 'conversation.chat.commandview'), {
+    node: { outcome },
+    t: key => key,
+  })
+}
+
+/** Mount the composer-dock seat with the folded command stream and Session lifecycle its owner supplies. */
+async function renderDock({ nodes, session, activeTargets = 0 }) {
+  const { registrations } = await loadClientSurface()
+  return drawComponent(componentOn(registrations, 'conversation.input.dock'), {
+    session,
+    input: {},
+    useChat: selector => selector({ legacy: { nodes } }),
+    useConversation: selector => selector({ activeTargets: { size: activeTargets } }),
+    t: key => key,
+  })
 }
 
 let clientApi
@@ -1679,8 +1710,8 @@ function subdirectoryFixture() {
   const api = await loadClientApi()
   assert.deepEqual(
     Object.keys(api.__test).sort(),
-    ['findingText', 'modeOf', 'parsePayload', 'readOutcome', 'reportOf', 'severityOf'],
-    'the Client half exposes copy helpers and the mode reader only — there is no send path to misuse',
+    ['findingText', 'modeOf', 'parsePayload', 'readOutcome', 'reportOf', 'severityOf', 'transcriptHidden'],
+    'the Client half exposes copy helpers, the mode reader and the transcript gate only — there is no send path to misuse',
   )
 
   assert.equal(api.__test.readOutcome(null).face, 'running')
@@ -4092,6 +4123,119 @@ const NOISY_NEEDLES = ['DEPENDENCY_NEEDLE', 'BUNDLE_NEEDLE', 'LOG_NEEDLE', 'VEND
     assert.equal(h.tools.calls.length, 1, `${what}: the harness was asked exactly once`)
     assert.equal(payloadOf(result.text).stats.context.calls, 1, `${what}: the refused search is still a call against the budget`)
   }
+}
+
+// 119 — a review asked for on a session that has not started a turn is drawn where that session can see it.
+{
+  const report = {
+    verdict: 'warn',
+    summary: 'The change set is sound but the retry path is thin.',
+    findings: [{
+      severity: 'major', title: 'Retry drops the reader budget', file: 'a.go', line: 12,
+      problem: 'p', impact: 'i', trigger: 'tr', suggestion: 's', evidence: '+x',
+    }],
+    withheld: [],
+    stats: { files: 2, added: 9, deleted: 3, reviewed: 2, skipped: [] },
+    reviewer: { provider: 'deepseek-official', model: 'deepseek-flash' },
+  }
+  const text = `## Code review — WARN\n\nA summary.\n\n${MARKER}\n\`\`\`json\n${JSON.stringify(report)}\n\`\`\`\n`
+  const nodes = [{
+    kind: 'command', seq: 5, commandId: 'cmd-1', name: 'review', args: ' full',
+    outcome: { kind: 'success', text },
+  }]
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+
+  const dock = await renderDock({ nodes, session: blank })
+  assert.ok(dock.texts.includes('Code review'), `the dock draws the report card: ${JSON.stringify(dock.texts)}`)
+  assert.ok(dock.texts.includes('warn'), 'chipped with the verdict the host sent')
+  assert.ok(dock.texts.includes('The change set is sound but the retry path is thin.'), 'opened by the summary the reviewer recorded')
+  assert.ok(dock.texts.includes('Retry drops the reader budget'), 'with the finding the report recorded')
+  assert.ok(dock.texts.includes('a.go:12'), 'and where it is')
+  assert.deepEqual(
+    dock.buttons,
+    ['action.copyReport', 'toggle.hide', 'action.copyFinding'],
+    'the same controls the transcript row offers, and nothing more',
+  )
+
+  const row = await renderCard({ kind: 'success', text })
+  assert.deepEqual(row.buttons, dock.buttons, 'both seats draw one card, not two dialects of it')
+  assert.ok(row.texts.includes('Retry drops the reader budget'), 'and the transcript row still draws it as before')
+}
+
+// 120 — the dock yields the moment the shell draws the transcript, and stays quiet without a review to stand for.
+{
+  const text = `## Code review — PASS\n\nNothing proven.\n\n${MARKER}\n\`\`\`json\n{"verdict":"pass","findings":[],"stats":{}}\n\`\`\`\n`
+  const nodes = [{
+    kind: 'command', seq: 5, commandId: 'cmd-1', name: 'review', args: '',
+    outcome: { kind: 'success', text },
+  }]
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+  const cases = [
+    ['the session has started', { session: { ...blank, blank: false }, activeTargets: 0 }],
+    ['a turn is running', { session: { ...blank, running: true }, activeTargets: 0 }],
+    ['a prompt was attempted', { session: { ...blank, promptAttempted: true }, activeTargets: 0 }],
+    ['a conversation target reports activity', { session: blank, activeTargets: 1 }],
+  ]
+  for (const [what, shape] of cases) {
+    const dock = await renderDock({ nodes, ...shape })
+    assert.deepEqual(dock.texts, [], `${what}: the dock draws nothing`)
+    assert.deepEqual(dock.buttons, [], `${what}: and offers nothing`)
+  }
+
+  const otherCommand = await renderDock({
+    nodes: [{ kind: 'command', seq: 7, commandId: 'cmd-9', name: 'plan', args: ' on', outcome: { kind: 'success', text: 'Plan mode on.' } }],
+    session: blank,
+  })
+  assert.deepEqual(otherCommand.texts, [], "a session whose newest command is not /review has no report to stand for")
+}
+
+// 121 — the dock reports the run itself, not only its end.
+{
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+  const running = await renderDock({
+    nodes: [{ kind: 'command', seq: 3, commandId: 'cmd-2', name: 'review', args: ' full', outcome: null }],
+    session: blank,
+  })
+  assert.ok(running.texts.includes('state.running'), 'a review in flight says so above the composer')
+  assert.deepEqual(running.buttons, [], 'and offers nothing to press while it runs')
+
+  const failed = await renderDock({
+    nodes: [{
+      kind: 'command', seq: 4, commandId: 'cmd-3', name: 'review', args: '',
+      outcome: { kind: 'error', text: 'code-review: the reviewer call failed — boom' },
+    }],
+    session: blank,
+  })
+  assert.ok(failed.texts.includes('state.error'), 'a failed review is reported as one, not hidden with the logs')
+  assert.ok(failed.texts.includes('code-review: the reviewer call failed — boom'), 'with its reason readable')
+  assert.deepEqual(failed.buttons, ['action.copyReport'], 'with the raw text copyable')
+}
+
+// 122 — the dock stands in for the newest review, whatever it settled as.
+{
+  const first = `## Code review — WARN\n\nFIRST_REPORT.\n\n${MARKER}\n\`\`\`json\n{"verdict":"warn","findings":[],"stats":{}}\n\`\`\`\n`
+  const nodes = [
+    { kind: 'command', seq: 5, commandId: 'cmd-1', name: 'review', args: '', outcome: { kind: 'success', text: first } },
+    { kind: 'command', seq: 8, commandId: 'cmd-2', name: 'plan', args: ' on', outcome: { kind: 'success', text: 'Plan mode on.' } },
+    { kind: 'command', seq: 9, commandId: 'cmd-3', name: 'review', args: ' mode=arc', outcome: { kind: 'error', text: 'code-review: unknown mode' } },
+  ]
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+  const dock = await renderDock({ nodes, session: blank })
+  assert.ok(dock.texts.includes('state.error'), 'the newest review is the one that settled last')
+  assert.ok(dock.texts.includes('code-review: unknown mode'), 'and its own text is what is shown')
+  assert.ok(!dock.texts.includes('Code review'), 'not the older report it replaced')
+}
+
+// 123 — the dock's gate is the shell's own blank-session gate, mirrored in one place.
+{
+  const { api } = await loadClientSurface()
+  const blank = { blank: true, running: false, promptAttempted: false, awaitingFirstTurn: true }
+  assert.equal(api.__test.transcriptHidden(blank, 0), true, 'a fresh session draws no transcript')
+  assert.equal(api.__test.transcriptHidden({ ...blank, running: true }, 0), false, 'a running turn brings the transcript')
+  assert.equal(api.__test.transcriptHidden({ ...blank, promptAttempted: true }, 0), false, 'an attempted prompt brings it too')
+  assert.equal(api.__test.transcriptHidden(blank, 1), false, 'a conversation target with activity brings it')
+  assert.equal(api.__test.transcriptHidden({ ...blank, blank: false }, 0), false, 'a started conversation is not blank')
+  assert.equal(api.__test.transcriptHidden(undefined, 0), false, 'an absent Session has no dock to fill')
 }
 
 console.log('selftest: all checks passed')
